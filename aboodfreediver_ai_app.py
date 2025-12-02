@@ -74,7 +74,16 @@ def pick_urls_for_question(q: str) -> list[str]:
     if any(k in q_low for k in ["course", "basic", "advanced", "discover",
                                 "fun dive", "fun freediving", "training",
                                 "session", "padi", "snorkel guide"]):
-        urls.add("https://aboodfreediver.com/courses.html")
+        urls.update({
+            "https://aboodfreediver.com/courses.html",
+            "https://aboodfreediver.com/Discoverfreediving.html",
+            "https://aboodfreediver.com/BasicFreediver.html",
+            "https://aboodfreediver.com/Freediver.html",
+            "https://aboodfreediver.com/Advancedfreediver.html",
+            "https://aboodfreediver.com/trainingsession.html",
+            "https://aboodfreediver.com/FunFreediving.html",
+            "https://aboodfreediver.com/snorkelguide.html",
+        })
 
     # FAQ / requirements
     if any(k in q_low for k in ["faq", "question", "requirement", "requirements",
