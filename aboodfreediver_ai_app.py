@@ -1,194 +1,135 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from google import genai
-from google.genai.types import GenerateContentConfig
+from __future__ import annotations
+
 import os
+import re
 import uuid
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-# ============================================================
-# CONFIG
-# ============================================================
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-ASSISTANT_NAME = "Nerida"
-MODEL_NAME = "gemini-2.5-flash"
 
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="Abood Freediver AI Mermaid", version="1.0.0")
 
-# SMTP (IONOS)
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-SMTP_FROM = os.getenv("SMTP_FROM")
-OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL")
-
-OWNER_ADMIN_TOKEN = os.getenv("OWNER_ADMIN_TOKEN", "")
-
-# ============================================================
-# EMAIL
-# ============================================================
-
-def send_email(subject: str, body: str):
-    msg = MIMEMultipart()
-    msg["From"] = SMTP_FROM
-    msg["To"] = OWNER_NOTIFY_EMAIL
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-
-# ============================================================
-# CONVERSATIONS (in-memory)
-# ============================================================
-
-CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
-
-def now():
-    return datetime.now(timezone.utc).isoformat()
-
-def get_session(session_id: Optional[str]) -> str:
-    if session_id and session_id in CONVERSATIONS:
-        return session_id
-    sid = session_id or str(uuid.uuid4())
-    CONVERSATIONS[sid] = {
-        "created": now(),
-        "updated": now(),
-        "messages": [],
-        "needs_human": False,
-    }
-    return sid
-
-def add_msg(sid: str, role: str, text: str):
-    CONVERSATIONS[sid]["messages"].append({
-        "role": role,
-        "text": text,
-        "ts": now()
-    })
-    CONVERSATIONS[sid]["updated"] = now()
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-SYSTEM_PROMPT = f"""
-You are {ASSISTANT_NAME}, a professional Freediver Assistant.
-
-IMPORTANT RULE:
-- You must NOT confirm availability, prices, or bookings.
-- If something requires confirmation, explain politely.
-"""
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(title="Nerida – Freediver Assistant")
+# Allow calls from your website + local dev; keep "*" if you don't want to manage origins
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+origins = ["*"] if ALLOWED_ORIGINS.strip() == "*" else [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# -----------------------------
+# Models
+# -----------------------------
 class ChatRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[str] = None
+    history: Optional[List[Dict[str, str]]] = None  # [{role:"user"|"assistant", content:"..."}]
+    email: Optional[str] = None  # optional follow-up email (front-end can send it if you add a field)
+
 
 class ChatResponse(BaseModel):
-    session_id: str
     answer: str
-    needs_human: bool
+    session_id: str
+    source: str = "fallback"
 
-def admin_auth(x_owner_token: Optional[str] = Header(None)):
-    if x_owner_token != OWNER_ADMIN_TOKEN:
-        raise HTTPException(401, "Unauthorized")
 
-# ============================================================
-# CHAT ENDPOINT (UPDATED)
-# ============================================================
+# -----------------------------
+# Optional: OpenAI (if OPENAI_API_KEY is set)
+# -----------------------------
+def _try_openai_chat(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
+    if not api_key:
+        return None
+
+    # Lazy import so the app still runs if openai isn't installed.
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception:
+        return None
+
+    client = OpenAI(api_key=api_key)
+
+    system = (
+        "You are AI Mermaid, the assistant for Abood Freediver (freediving courses in Aqaba, Jordan / Red Sea). "
+        "Answer questions briefly and clearly. If the user asks about bookings, prices, or availability, "
+        "direct them to the relevant site pages (Contact, Calendar, Prices)."
+    )
+
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": system}]
+
+    if history:
+        # Keep only safe roles and limit size
+        for m in history[-12:]:
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                msgs.append({"role": role, "content": content})
+
+    msgs.append({"role": "user", "content": question})
+
+    try:
+        resp = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=msgs,
+            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.4")),
+        )
+        return (resp.choices[0].message.content or "").strip() or None
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Fallback responder (so UI never hangs)
+# -----------------------------
+def _fallback_answer(question: str) -> str:
+    q = question.strip().lower()
+
+    if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
+        return "You can find current course prices here: https://www.aboodfreediver.com/Prices.php?lang=en"
+    if any(k in q for k in ["calendar", "availability", "schedule", "date", "dates"]):
+        return "Check upcoming trips and course dates here: https://www.aboodfreediver.com/calender.php"
+    if any(k in q for k in ["contact", "email", "whatsapp", "phone", "book", "booking", "reserve"]):
+        return "To book or ask details, please use the contact page: https://www.aboodfreediver.com/form1.php"
+    if any(k in q for k in ["hello", "hi", "hey", "good morning", "good evening"]):
+        return "Hi! Ask me about courses, prices, the calendar, safety, or what you can see while freediving in Aqaba."
+    # generic
+    return (
+        "I can help with course info, prices, dates, safety, and recommendations for Aqaba/Red Sea. "
+        "Ask a specific question (e.g., “How long is the Freediver course?”)."
+    )
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    if not req.question.strip():
-        raise HTTPException(400, "Empty question")
+def chat(req: ChatRequest) -> ChatResponse:
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
 
-    sid = get_session(req.session_id)
-    user_question = req.question.strip()
+    session_id = (req.session_id or "").strip() or str(uuid.uuid4())
 
-    add_msg(sid, "user", user_question)
+    # Try OpenAI if configured, otherwise fallback.
+    answer = _try_openai_chat(question, req.history)
+    if answer:
+        return ChatResponse(answer=answer, session_id=session_id, source="openai")
 
-    prompt = f"""
-{SYSTEM_PROMPT}
-
-Conversation so far:
-{CONVERSATIONS[sid]["messages"]}
-
-User question:
-{user_question}
-"""
-
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=GenerateContentConfig()
-    )
-
-    answer = (response.text or "").strip()
-    add_msg(sid, "assistant", answer)
-
-    # ========================================================
-    # 🔔 BOOKING KEYWORDS → ALWAYS NOTIFY OWNER
-    # ========================================================
-
-    booking_keywords = [
-        "book", "booking", "reserve", "availability",
-        "tomorrow", "today", "confirm", "confirmation", "date"
-    ]
-
-    needs_human = any(k in user_question.lower() for k in booking_keywords)
-
-    if needs_human:
-        CONVERSATIONS[sid]["needs_human"] = True
-
-        email_body = (
-            f"Session ID: {sid}\n\n"
-            f"FULL CONVERSATION:\n\n"
-            f"{CONVERSATIONS[sid]['messages']}"
-        )
-
-        send_email(
-            subject="[Nerida] Booking-related question (Human attention required)",
-            body=email_body
-        )
-
-    return ChatResponse(
-        session_id=sid,
-        answer=answer,
-        needs_human=needs_human
-    )
-
-# ============================================================
-# ADMIN ENDPOINTS
-# ============================================================
-
-@app.get("/admin/conversations", dependencies=[Depends(admin_auth)])
-async def admin_conversations():
-    return CONVERSATIONS
-
-@app.post("/human", dependencies=[Depends(admin_auth)])
-async def human_reply(session_id: str, message: str):
-    add_msg(session_id, "human", message)
-    CONVERSATIONS[session_id]["needs_human"] = False
-    return {"ok": True}
+    return ChatResponse(answer=_fallback_answer(question), session_id=session_id, source="fallback")
