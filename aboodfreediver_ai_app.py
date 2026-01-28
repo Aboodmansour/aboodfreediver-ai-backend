@@ -4,12 +4,24 @@ from pydantic import BaseModel
 from google import genai
 from google.genai.types import GenerateContentConfig
 import os
+import time
+import random
+import logging
+
+# -----------------------------
+# Logging
+# -----------------------------
+logger = logging.getLogger("ai_mermaid")
+logging.basicConfig(level=logging.INFO)
 
 # -----------------------------
 # Gemini client configuration
 # -----------------------------
-# If you set GEMINI_API_KEY or GOOGLE_API_KEY in env, this is enough:
-client = genai.Client()
+API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY environment variable.")
+
+client = genai.Client(api_key=API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
 
 # -----------------------------
@@ -51,30 +63,39 @@ BASE_URLS = [
     "https://aboodfreediver.com/blog4.html",
 ]
 
+# Limit URL Context payload size to reduce intermittent tool failures
+MAX_URLS_PER_REQUEST = 8
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 def pick_urls_for_question(q: str) -> list[str]:
-    """Very simple router: choose which URLs to give based on keywords."""
+    """Deterministic router: choose which URLs to give based on keywords."""
     q_low = q.lower()
-    urls = set()
 
-    # Always give homepage as a fallback
     home = "https://aboodfreediver.com"
-    urls.add(home)
+    urls_list: list[str] = [home]  # keep deterministic order
 
     # Prices
     if any(k in q_low for k in ["price", "cost", "fee", "discount"]):
-        urls.add("https://aboodfreediver.com/prices.php")
+        urls_list.append("https://aboodfreediver.com/prices.php")
 
     # Calendar / dates / availability
     if any(k in q_low for k in ["calendar", "schedule", "when", "date", "time",
                                 "available", "availability", "booking", "book"]):
-        urls.add("https://aboodfreediver.com/calendar.php")
+        urls_list.append("https://aboodfreediver.com/calendar.php")
 
     # Courses & training
     if any(k in q_low for k in ["course", "basic", "advanced", "discover",
                                 "fun dive", "fun freediving", "training",
                                 "session", "padi", "snorkel guide"]):
-        urls.update({
+        urls_list.extend([
             "https://aboodfreediver.com/courses.html",
             "https://aboodfreediver.com/Discoverfreediving.html",
             "https://aboodfreediver.com/BasicFreediver.html",
@@ -83,62 +104,75 @@ def pick_urls_for_question(q: str) -> list[str]:
             "https://aboodfreediver.com/trainingsession.html",
             "https://aboodfreediver.com/FunFreediving.html",
             "https://aboodfreediver.com/snorkelguide.html",
-        })
+        ])
 
     # FAQ / requirements
     if any(k in q_low for k in ["faq", "question", "requirement", "requirements",
                                 "age", "medical", "experience"]):
-        urls.add("https://aboodfreediver.com/faq.html")
+        urls_list.append("https://aboodfreediver.com/faq.html")
 
     # Contact
     if any(k in q_low for k in ["contact", "phone", "email", "whatsapp",
                                 "reach you", "get in touch"]):
-        urls.add("https://aboodfreediver.com/form1.php")
+        urls_list.append("https://aboodfreediver.com/form1.php")
 
     # Equipment
     if any(k in q_low for k in ["equipment", "gear", "fins", "mask", "wetsuit"]):
-        urls.add("https://aboodfreediver.com/freedivingequipment.html")
+        urls_list.append("https://aboodfreediver.com/freedivingequipment.html")
 
     # Photography
     if any(k in q_low for k in ["photo", "photography", "pictures", "photoshoot",
                                 "camera", "underwater photos"]):
-        urls.add("https://aboodfreediver.com/photographysession.html")
+        urls_list.append("https://aboodfreediver.com/photographysession.html")
 
     # Dive sites / wrecks
     if any(k in q_low for k in ["dive site", "divesites", "wreck", "cedar pride",
                                 "tank", "c-130", "tristar", "military"]):
-        urls.update({
+        urls_list.extend([
             "https://aboodfreediver.com/divesites.html",
             "https://aboodfreediver.com/cedar-pride.html",
             "https://aboodfreediver.com/military.html",
             "https://aboodfreediver.com/Tristar.html",
             "https://aboodfreediver.com/C-130.html",
             "https://aboodfreediver.com/Tank.html",
-        })
+        ])
 
     # Blog / tips / articles
     if any(k in q_low for k in ["blog", "article", "tip", "tips", "story", "stories"]):
-        urls.update({
+        urls_list.extend([
             "https://aboodfreediver.com/blog.html",
             "https://aboodfreediver.com/blog2.html",
             "https://aboodfreediver.com/blog3.html",
             "https://aboodfreediver.com/blog4.html",
-        })
+        ])
 
-    # If we didn't detect anything special, just return a broad selection
-    if len(urls) == 1:  # only homepage so far
-        urls.update(BASE_URLS)
+    # If we didn't detect anything special, return a deterministic broad selection
+    if len(urls_list) == 1:  # only homepage so far
+        urls_list.extend(BASE_URLS)
 
-    urls_list = list(urls)
+    # Dedupe while preserving order
+    urls_list = dedupe_preserve_order(urls_list)
 
-    # URL Context supports up to 20 URLs per request; enforce that limit.
-    # Keep homepage first, then other URLs in any order up to 19 more.
-    if len(urls_list) > 20:
-        others = [u for u in urls_list if u != home]
-        urls_list = [home] + others[:19]
+    # Enforce URL Context limit (use a smaller cap for stability)
+    # Always keep homepage first
+    if urls_list and urls_list[0] != home:
+        urls_list = [home] + [u for u in urls_list if u != home]
 
-    return urls_list
+    return urls_list[:MAX_URLS_PER_REQUEST]
 
+# -----------------------------
+# Simple retry wrapper
+# -----------------------------
+def call_gemini_with_retry(callable_fn, attempts: int = 3, base_delay: float = 0.6):
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return callable_fn()
+        except Exception as e:
+            last_exc = e
+            sleep_s = base_delay * (2 ** i) + random.uniform(0, 0.25)
+            time.sleep(sleep_s)
+    raise last_exc
 
 # -----------------------------
 # System prompt
@@ -181,15 +215,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class ChatRequest(BaseModel):
     question: str
-
 
 class ChatResponse(BaseModel):
     answer: str
     source: str = MODEL_NAME
-
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(payload: ChatRequest):
@@ -215,13 +246,16 @@ User question:
 """
 
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=GenerateContentConfig(
-                tools=[{"url_context": {}}]
-            ),
-        )
+        def _do():
+            return client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=GenerateContentConfig(
+                    tools=[{"url_context": {}}]
+                ),
+            )
+
+        response = call_gemini_with_retry(_do, attempts=3)
 
         answer = (response.text or "").strip() if response else ""
 
@@ -234,8 +268,12 @@ User question:
         return ChatResponse(answer=answer, source=MODEL_NAME)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini error: {e}")
-
+        # Log full exception server-side, return stable message to client
+        logger.exception("Gemini call failed. urls=%s question=%r", urls, user_question)
+        raise HTTPException(
+            status_code=503,
+            detail="AI service temporarily unavailable. Please try again in a moment."
+        )
 
 @app.get("/")
 async def root():
