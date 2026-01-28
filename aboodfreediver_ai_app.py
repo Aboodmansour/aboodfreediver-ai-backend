@@ -1,280 +1,202 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai.types import GenerateContentConfig
 import os
 import time
 import random
 import logging
+import uuid
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
-# -----------------------------
-# Logging
-# -----------------------------
-logger = logging.getLogger("ai_mermaid")
+# ============================================================
+# CONFIG
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("freediver_assistant")
 
-# -----------------------------
-# Gemini client configuration
-# -----------------------------
-API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-if not API_KEY:
-    raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY environment variable.")
+ASSISTANT_NAME = "Nerida"
+ASSISTANT_ROLE = "Freediver Assistant"
 
-client = genai.Client(api_key=API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
+GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if not GEMINI_KEY:
+    raise RuntimeError("Missing Gemini API key")
 
-# -----------------------------
-# Known important URLs
-# -----------------------------
-BASE_URLS = [
-    "https://aboodfreediver.com",                     # home
-    "https://aboodfreediver.com/courses.html",        # courses overview
-    "https://aboodfreediver.com/prices.php",          # prices page
-    "https://aboodfreediver.com/calendar.php",        # calendar / schedule
-    "https://aboodfreediver.com/faq.html",            # FAQ
-    "https://aboodfreediver.com/form1.php",           # contact page
+client = genai.Client(api_key=GEMINI_KEY)
 
-    # Course pages
-    "https://aboodfreediver.com/Discoverfreediving.html",
-    "https://aboodfreediver.com/BasicFreediver.html",
-    "https://aboodfreediver.com/Freediver.html",
-    "https://aboodfreediver.com/Advancedfreediver.html",
-    "https://aboodfreediver.com/trainingsession.html",
-    "https://aboodfreediver.com/FunFreediving.html",
-    "https://aboodfreediver.com/snorkelguide.html",
+# SMTP (IONOS)
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_FROM = os.getenv("SMTP_FROM")
+OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL")
 
-    # Services / equipment / photography
-    "https://aboodfreediver.com/freedivingequipment.html",
-    "https://aboodfreediver.com/photographysession.html",
+OWNER_ADMIN_TOKEN = os.getenv("OWNER_ADMIN_TOKEN", "")
 
-    # Dive sites
-    "https://aboodfreediver.com/divesites.html",
-    "https://aboodfreediver.com/cedar-pride.html",
-    "https://aboodfreediver.com/military.html",
-    "https://aboodfreediver.com/Tristar.html",
-    "https://aboodfreediver.com/C-130.html",
-    "https://aboodfreediver.com/Tank.html",
-
-    # Blog articles
-    "https://aboodfreediver.com/blog.html",
-    "https://aboodfreediver.com/blog2.html",
-    "https://aboodfreediver.com/blog3.html",
-    "https://aboodfreediver.com/blog4.html",
-]
-
-# Limit URL Context payload size to reduce intermittent tool failures
 MAX_URLS_PER_REQUEST = 8
 
-def dedupe_preserve_order(items: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+# ============================================================
+# EMAIL
+# ============================================================
 
-def pick_urls_for_question(q: str) -> list[str]:
-    """Deterministic router: choose which URLs to give based on keywords."""
-    q_low = q.lower()
+def send_email(subject: str, body: str):
+    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, OWNER_NOTIFY_EMAIL]):
+        logger.warning("SMTP not fully configured")
+        return
 
-    home = "https://aboodfreediver.com"
-    urls_list: list[str] = [home]  # keep deterministic order
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_FROM
+    msg["To"] = OWNER_NOTIFY_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    # Prices
-    if any(k in q_low for k in ["price", "cost", "fee", "discount"]):
-        urls_list.append("https://aboodfreediver.com/prices.php")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
 
-    # Calendar / dates / availability
-    if any(k in q_low for k in ["calendar", "schedule", "when", "date", "time",
-                                "available", "availability", "booking", "book"]):
-        urls_list.append("https://aboodfreediver.com/calendar.php")
+# ============================================================
+# CONVERSATIONS (in-memory)
+# ============================================================
 
-    # Courses & training
-    if any(k in q_low for k in ["course", "basic", "advanced", "discover",
-                                "fun dive", "fun freediving", "training",
-                                "session", "padi", "snorkel guide"]):
-        urls_list.extend([
-            "https://aboodfreediver.com/courses.html",
-            "https://aboodfreediver.com/Discoverfreediving.html",
-            "https://aboodfreediver.com/BasicFreediver.html",
-            "https://aboodfreediver.com/Freediver.html",
-            "https://aboodfreediver.com/Advancedfreediver.html",
-            "https://aboodfreediver.com/trainingsession.html",
-            "https://aboodfreediver.com/FunFreediving.html",
-            "https://aboodfreediver.com/snorkelguide.html",
-        ])
+CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
 
-    # FAQ / requirements
-    if any(k in q_low for k in ["faq", "question", "requirement", "requirements",
-                                "age", "medical", "experience"]):
-        urls_list.append("https://aboodfreediver.com/faq.html")
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
-    # Contact
-    if any(k in q_low for k in ["contact", "phone", "email", "whatsapp",
-                                "reach you", "get in touch"]):
-        urls_list.append("https://aboodfreediver.com/form1.php")
+def get_session(session_id: Optional[str]) -> str:
+    if session_id and session_id in CONVERSATIONS:
+        return session_id
+    sid = session_id or str(uuid.uuid4())
+    CONVERSATIONS[sid] = {
+        "created": now(),
+        "updated": now(),
+        "messages": [],
+        "needs_human": False,
+    }
+    return sid
 
-    # Equipment
-    if any(k in q_low for k in ["equipment", "gear", "fins", "mask", "wetsuit"]):
-        urls_list.append("https://aboodfreediver.com/freedivingequipment.html")
+def add_msg(sid: str, role: str, text: str):
+    CONVERSATIONS[sid]["messages"].append({
+        "role": role,
+        "text": text,
+        "ts": now()
+    })
+    CONVERSATIONS[sid]["updated"] = now()
 
-    # Photography
-    if any(k in q_low for k in ["photo", "photography", "pictures", "photoshoot",
-                                "camera", "underwater photos"]):
-        urls_list.append("https://aboodfreediver.com/photographysession.html")
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 
-    # Dive sites / wrecks
-    if any(k in q_low for k in ["dive site", "divesites", "wreck", "cedar pride",
-                                "tank", "c-130", "tristar", "military"]):
-        urls_list.extend([
-            "https://aboodfreediver.com/divesites.html",
-            "https://aboodfreediver.com/cedar-pride.html",
-            "https://aboodfreediver.com/military.html",
-            "https://aboodfreediver.com/Tristar.html",
-            "https://aboodfreediver.com/C-130.html",
-            "https://aboodfreediver.com/Tank.html",
-        ])
+SYSTEM_PROMPT = f"""
+You are {ASSISTANT_NAME}, a professional Freediver Assistant.
 
-    # Blog / tips / articles
-    if any(k in q_low for k in ["blog", "article", "tip", "tips", "story", "stories"]):
-        urls_list.extend([
-            "https://aboodfreediver.com/blog.html",
-            "https://aboodfreediver.com/blog2.html",
-            "https://aboodfreediver.com/blog3.html",
-            "https://aboodfreediver.com/blog4.html",
-        ])
+RULE – HUMAN TAKEOVER:
+If you are not confident, or the question needs exact confirmation,
+start your reply with:
 
-    # If we didn't detect anything special, return a deterministic broad selection
-    if len(urls_list) == 1:  # only homepage so far
-        urls_list.extend(BASE_URLS)
+NEEDS_HUMAN: true
 
-    # Dedupe while preserving order
-    urls_list = dedupe_preserve_order(urls_list)
-
-    # Enforce URL Context limit (use a smaller cap for stability)
-    # Always keep homepage first
-    if urls_list and urls_list[0] != home:
-        urls_list = [home] + [u for u in urls_list if u != home]
-
-    return urls_list[:MAX_URLS_PER_REQUEST]
-
-# -----------------------------
-# Simple retry wrapper
-# -----------------------------
-def call_gemini_with_retry(callable_fn, attempts: int = 3, base_delay: float = 0.6):
-    last_exc = None
-    for i in range(attempts):
-        try:
-            return callable_fn()
-        except Exception as e:
-            last_exc = e
-            sleep_s = base_delay * (2 ** i) + random.uniform(0, 0.25)
-            time.sleep(sleep_s)
-    raise last_exc
-
-# -----------------------------
-# System prompt
-# -----------------------------
-SYSTEM_PROMPT = """
-You are "AI Mermaid", an AI employee and digital assistant for Abood Freediver
-and the website aboodfreediver.com.
-
-Identity and how to present yourself:
-- When a user asks who you are, say that you are an AI employee / AI assistant
-  for Abood Freediver, created to help visitors and students.
-- When a user asks if you work for Abood Freediver, answer that you are an AI
-  assistant working with Abood Freediver, not a human, but part of the Abood
-  Freediver team to support them online.
-
-Tasks:
-- Answer questions about freediving technique, training, equalization, risks and safety.
-- Answer questions about Abood Freediver services, courses, prices, calendar, and contact info.
-
-Use the provided URLs with the URL Context tool to:
-- Read the latest prices, course descriptions, calendar dates, and FAQ answers.
-- Avoid hallucinating specific numbers or dates: always prefer what you actually read from the URLs.
-- If something is not clearly on the site, say you're not sure and suggest the user contact Abood Freediver.
-
-Language:
-- Answer in the same language the user uses (English, German, French, Spanish, Italian, Portuguese, Dutch, Chinese, Japanese, Korean, Russian, Arabic).
-- Keep answers short, clear and practical unless the user asks for more detail.
+Then explain briefly why.
 """
 
-# -----------------------------
-# FastAPI setup
-# -----------------------------
-app = FastAPI(title="AboodFreediver AI Mermaid API")
+def needs_human(text: str) -> bool:
+    return "needs_human: true" in text.lower()
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(title="Nerida – Freediver Assistant")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # optionally restrict to ["https://aboodfreediver.com"]
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 class ChatRequest(BaseModel):
     question: str
+    session_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
+    session_id: str
     answer: str
-    source: str = MODEL_NAME
+    needs_human: bool
+
+def admin_auth(x_owner_token: Optional[str] = Header(None)):
+    if x_owner_token != OWNER_ADMIN_TOKEN:
+        raise HTTPException(401, "Unauthorized")
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(payload: ChatRequest):
-    if not payload.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+async def chat(req: ChatRequest):
+    if not req.question.strip():
+        raise HTTPException(400, "Empty question")
 
-    user_question = payload.question.strip()
-    urls = pick_urls_for_question(user_question)
-    urls_block = "\n".join(urls)
+    sid = get_session(req.session_id)
+    add_msg(sid, "user", req.question)
 
     prompt = f"""
 {SYSTEM_PROMPT}
 
-You have access to the following URLs from aboodfreediver.com.
-Use the URL Context tool to read them and ground your answer
-in the latest information from the site.
-
-URLs:
-{urls_block}
+Conversation:
+{CONVERSATIONS[sid]["messages"]}
 
 User question:
-{user_question}
+{req.question}
 """
 
     try:
-        def _do():
-            return client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=GenerateContentConfig(
-                    tools=[{"url_context": {}}]
-                ),
-            )
-
-        response = call_gemini_with_retry(_do, attempts=3)
-
-        answer = (response.text or "").strip() if response else ""
-
-        if not answer:
-            answer = (
-                "Sorry, I could not read the website or generate an answer right now. "
-                "Please try again or contact Abood Freediver directly."
-            )
-
-        return ChatResponse(answer=answer, source=MODEL_NAME)
+        resp = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=GenerateContentConfig()
+        )
+        answer = (resp.text or "").strip()
 
     except Exception as e:
-        # Log full exception server-side, return stable message to client
-        logger.exception("Gemini call failed. urls=%s question=%r", urls, user_question)
-        raise HTTPException(
-            status_code=503,
-            detail="AI service temporarily unavailable. Please try again in a moment."
+        send_email(
+            "[Nerida] AI ERROR",
+            f"Session: {sid}\nError: {e}"
         )
+        raise HTTPException(503, "AI unavailable")
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "AI Mermaid (Gemini + URL Context)"}
+    if not answer:
+        answer = "NEEDS_HUMAN: true\nI could not answer this."
+
+    add_msg(sid, "assistant", answer)
+    flag = needs_human(answer)
+
+    if flag:
+        body = (
+            f"Session: {sid}\n\n"
+            f"FULL CONVERSATION:\n"
+            f"{CONVERSATIONS[sid]['messages']}"
+        )
+        send_email("[Nerida] Human support needed", body)
+        CONVERSATIONS[sid]["needs_human"] = True
+
+    return ChatResponse(
+        session_id=sid,
+        answer=answer,
+        needs_human=flag
+    )
+
+@app.get("/admin/conversations", dependencies=[Depends(admin_auth)])
+async def admin_conversations():
+    return CONVERSATIONS
+
+@app.post("/human", dependencies=[Depends(admin_auth)])
+async def human_reply(session_id: str, message: str):
+    add_msg(session_id, "human", message)
+    CONVERSATIONS[session_id]["needs_human"] = False
+    return {"ok": True}
