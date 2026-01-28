@@ -1,113 +1,111 @@
 from __future__ import annotations
 
 import os
-import re
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
-
+import secrets
 
 # -----------------------------
-# FastAPI app
+# App
 # -----------------------------
-app = FastAPI(title="Abood Freediver AI Mermaid", version="1.0.0")
-
-# Allow calls from your website + local dev; keep "*" if you don't want to manage origins
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-origins = ["*"] if ALLOWED_ORIGINS.strip() == "*" else [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+security = HTTPBasic()
+
+# -----------------------------
+# In-memory storage
+# -----------------------------
+CONVERSATIONS: Dict[str, Dict] = {}
+# session_id -> {
+#   "messages": [{role, text, seen}],
+#   "needs_human": bool,
+#   "created": datetime
+# }
 
 # -----------------------------
 # Models
 # -----------------------------
 class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=4000)
+    question: str = Field(..., min_length=1)
     session_id: Optional[str] = None
-    history: Optional[List[Dict[str, str]]] = None  # [{role:"user"|"assistant", content:"..."}]
-    email: Optional[str] = None  # optional follow-up email (front-end can send it if you add a field)
 
 
 class ChatResponse(BaseModel):
     answer: str
     session_id: str
-    source: str = "fallback"
+    needs_human: bool = False
+
+
+class HumanReply(BaseModel):
+    session_id: str
+    message: str
 
 
 # -----------------------------
-# Optional: OpenAI (if OPENAI_API_KEY is set)
+# Auth
 # -----------------------------
-def _try_openai_chat(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY")
-    if not api_key:
-        return None
-
-    # Lazy import so the app still runs if openai isn't installed.
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception:
-        return None
-
-    client = OpenAI(api_key=api_key)
-
-    system = (
-        "You are AI Mermaid, the assistant for Abood Freediver (freediving courses in Aqaba, Jordan / Red Sea). "
-        "Answer questions briefly and clearly. If the user asks about bookings, prices, or availability, "
-        "direct them to the relevant site pages (Contact, Calendar, Prices)."
+def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    user_ok = secrets.compare_digest(
+        credentials.username, os.getenv("ADMIN_USER", "")
     )
+    pass_ok = secrets.compare_digest(
+        credentials.password, os.getenv("ADMIN_PASS", "")
+    )
+    if not (user_ok and pass_ok):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
 
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": system}]
 
-    if history:
-        # Keep only safe roles and limit size
-        for m in history[-12:]:
-            role = (m.get("role") or "").strip()
-            content = (m.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
-                msgs.append({"role": role, "content": content})
+# -----------------------------
+# Aqua logic
+# -----------------------------
+def aqua_answer(question: str) -> tuple[str, bool]:
+    q = question.lower()
 
-    msgs.append({"role": "user", "content": question})
-
-    try:
-        resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=msgs,
-            temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.4")),
+    if any(k in q for k in ["price", "cost", "how much"]):
+        return (
+            "You can see current prices here:\nhttps://www.aboodfreediver.com/Prices.php?lang=en",
+            False,
         )
-        return (resp.choices[0].message.content or "").strip() or None
-    except Exception:
-        return None
 
+    if any(k in q for k in ["calendar", "availability", "available", "date"]):
+        return (
+            "If there is no scheduled event on the calendar, we are usually available. "
+            "I just need to confirm with the instructor first 🙂",
+            True,
+        )
 
-# -----------------------------
-# Fallback responder (so UI never hangs)
-# -----------------------------
-def _fallback_answer(question: str) -> str:
-    q = question.strip().lower()
+    if any(k in q for k in ["book", "booking", "reserve"]):
+        return (
+            "I can help with booking. Let me check availability with the instructor.",
+            True,
+        )
 
-    if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
-        return "You can find current course prices here: https://www.aboodfreediver.com/Prices.php?lang=en"
-    if any(k in q for k in ["calendar", "availability", "schedule", "date", "dates"]):
-        return "Check upcoming trips and course dates here: https://www.aboodfreediver.com/calender.php"
-    if any(k in q for k in ["contact", "email", "whatsapp", "phone", "book", "booking", "reserve"]):
-        return "To book or ask details, please use the contact page: https://www.aboodfreediver.com/form1.php"
-    if any(k in q for k in ["hello", "hi", "hey", "good morning", "good evening"]):
-        return "Hi! Ask me about courses, prices, the calendar, safety, or what you can see while freediving in Aqaba."
-    # generic
+    if any(k in q for k in ["hello", "hi", "hey"]):
+        return (
+            "Hi, I’m Aqua 🌊 Ask me about freediving courses, prices, safety, or availability in Aqaba.",
+            False,
+        )
+
     return (
-        "I can help with course info, prices, dates, safety, and recommendations for Aqaba/Red Sea. "
-        "Ask a specific question (e.g., “How long is the Freediver course?”)."
+        "I can help with freediving courses, safety, prices, and availability in Aqaba. "
+        "If your question needs confirmation, I’ll check with the instructor.",
+        False,
     )
 
 
@@ -115,21 +113,106 @@ def _fallback_answer(question: str) -> str:
 # Routes
 # -----------------------------
 @app.get("/health")
-def health() -> Dict[str, Any]:
-    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+def health():
+    return {"ok": True, "time": datetime.utcnow().isoformat()}
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
-    question = (req.question or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="question is required")
+def chat(req: ChatRequest):
+    session_id = req.session_id or str(uuid.uuid4())
 
-    session_id = (req.session_id or "").strip() or str(uuid.uuid4())
+    answer, needs_human = aqua_answer(req.question)
 
-    # Try OpenAI if configured, otherwise fallback.
-    answer = _try_openai_chat(question, req.history)
-    if answer:
-        return ChatResponse(answer=answer, session_id=session_id, source="openai")
+    convo = CONVERSATIONS.setdefault(
+        session_id,
+        {
+            "messages": [],
+            "needs_human": False,
+            "created": datetime.utcnow(),
+        },
+    )
 
-    return ChatResponse(answer=_fallback_answer(question), session_id=session_id, source="fallback")
+    convo["messages"].append(
+        {"role": "user", "text": req.question, "seen": True}
+    )
+
+    convo["messages"].append(
+        {"role": "assistant", "text": answer, "seen": True}
+    )
+
+    if needs_human:
+        convo["needs_human"] = True
+
+    return ChatResponse(
+        answer=answer,
+        session_id=session_id,
+        needs_human=needs_human,
+    )
+
+
+@app.get("/chat/status")
+def chat_status(session_id: str):
+    convo = CONVERSATIONS.get(session_id)
+    if not convo:
+        return {"messages": []}
+
+    return {
+        "messages": convo["messages"],
+        "needs_human": convo["needs_human"],
+    }
+
+
+@app.post("/human")
+def human_reply(data: HumanReply, _: bool = Depends(admin_auth)):
+    convo = CONVERSATIONS.get(data.session_id)
+    if not convo:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    convo["messages"].append(
+        {"role": "human", "text": data.message, "seen": False}
+    )
+    convo["needs_human"] = False
+
+    return {"ok": True}
+
+
+# -----------------------------
+# Simple Admin Dashboard
+# -----------------------------
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(_: bool = Depends(admin_auth)):
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Aqua – Instructor Dashboard</title>
+  <style>
+    body { font-family: Arial; padding: 20px; max-width: 600px }
+    input, textarea, button { width: 100%; margin: 8px 0; padding: 8px }
+  </style>
+</head>
+<body>
+  <h2>Reply as Human Instructor</h2>
+
+  <input id="sid" placeholder="Session ID">
+  <textarea id="msg" rows="4" placeholder="Your reply to the diver"></textarea>
+  <button onclick="send()">Send Reply</button>
+
+  <pre id="out"></pre>
+
+<script>
+async function send() {
+  const res = await fetch('/human', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: document.getElementById('sid').value,
+      message: document.getElementById('msg').value
+    })
+  });
+  document.getElementById('out').textContent = await res.text();
+}
+</script>
+</body>
+</html>
+"""
