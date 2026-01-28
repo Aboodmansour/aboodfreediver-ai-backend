@@ -190,7 +190,13 @@ User question:
         answer=answer,
         needs_human=flag
     )
-
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "Nerida – Freediver Assistant",
+        "platform": "Render"
+    }
 @app.get("/admin/conversations", dependencies=[Depends(admin_auth)])
 async def admin_conversations():
     return CONVERSATIONS
