@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from google import genai
 from google.genai.types import GenerateContentConfig
 import os
@@ -168,32 +168,10 @@ User question:
             f"{CONVERSATIONS[sid]['messages']}"
         )
 
-        # Notify site owner
-        try:
-            send_email(
-                to_email=OWNER_NOTIFY_EMAIL,
-                subject="[Nerida] Booking-related question (Human attention required)",
-                body=email_body,
-                reply_to=str(request.user_email) if request.user_email else None
-            )
-        except Exception:
-            logger.exception("Failed to send owner email")
-
-        # Confirmation to the visitor (if email provided)
-        if request.user_email:
-            try:
-                send_email(
-                    to_email=str(request.user_email),
-                    subject="We received your message (Abood Freediver)",
-                    body=(
-                        "Thanks for your message. A team member will follow up shortly.\n\n"
-                        f"Session ID: {sid}\n\n"
-                        f"Your question:\n{request.question}\n"
-                    )
-                )
-            except Exception:
-                logger.exception("Failed to send user confirmation email")
-
+        send_email(
+            subject="[Nerida] Booking-related question (Human attention required)",
+            body=email_body
+        )
 
     return ChatResponse(
         session_id=sid,
