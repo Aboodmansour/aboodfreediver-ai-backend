@@ -1,12 +1,9 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends 
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from google import genai
 from google.genai.types import GenerateContentConfig
 import os
-import time
-import random
-import logging
 import uuid
 import smtplib
 from email.mime.text import MIMEText
@@ -18,18 +15,12 @@ from typing import Optional, Dict, Any
 # CONFIG
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("freediver_assistant")
-
 ASSISTANT_NAME = "Nerida"
-ASSISTANT_ROLE = "Freediver Assistant"
-
 MODEL_NAME = "gemini-2.5-flash"
-GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-if not GEMINI_KEY:
-    raise RuntimeError("Missing Gemini API key")
 
-client = genai.Client(api_key=GEMINI_KEY)
+client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY")
+)
 
 # SMTP (IONOS)
 SMTP_HOST = os.getenv("SMTP_HOST")
@@ -41,17 +32,11 @@ OWNER_NOTIFY_EMAIL = os.getenv("OWNER_NOTIFY_EMAIL")
 
 OWNER_ADMIN_TOKEN = os.getenv("OWNER_ADMIN_TOKEN", "")
 
-MAX_URLS_PER_REQUEST = 8
-
 # ============================================================
 # EMAIL
 # ============================================================
 
 def send_email(subject: str, body: str):
-    if not all([SMTP_HOST, SMTP_USER, SMTP_PASSWORD, OWNER_NOTIFY_EMAIL]):
-        logger.warning("SMTP not fully configured")
-        return
-
     msg = MIMEMultipart()
     msg["From"] = SMTP_FROM
     msg["To"] = OWNER_NOTIFY_EMAIL
@@ -99,17 +84,10 @@ def add_msg(sid: str, role: str, text: str):
 SYSTEM_PROMPT = f"""
 You are {ASSISTANT_NAME}, a professional Freediver Assistant.
 
-RULE – HUMAN TAKEOVER:
-If you are not confident, or the question needs exact confirmation,
-start your reply with:
-
-NEEDS_HUMAN: true
-
-Then explain briefly why.
+IMPORTANT RULE:
+- You must NOT confirm availability, prices, or bookings.
+- If something requires confirmation, explain politely.
 """
-
-def needs_human(text: str) -> bool:
-    return "needs_human: true" in text.lower()
 
 # ============================================================
 # FASTAPI
@@ -137,59 +115,73 @@ def admin_auth(x_owner_token: Optional[str] = Header(None)):
     if x_owner_token != OWNER_ADMIN_TOKEN:
         raise HTTPException(401, "Unauthorized")
 
+# ============================================================
+# CHAT ENDPOINT (UPDATED)
+# ============================================================
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     if not req.question.strip():
         raise HTTPException(400, "Empty question")
 
     sid = get_session(req.session_id)
-    add_msg(sid, "user", req.question)
+    user_question = req.question.strip()
+
+    add_msg(sid, "user", user_question)
 
     prompt = f"""
 {SYSTEM_PROMPT}
 
-Conversation:
+Conversation so far:
 {CONVERSATIONS[sid]["messages"]}
 
 User question:
-{req.question}
+{user_question}
 """
 
-    try:
-        resp = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=GenerateContentConfig()
-        )
-        answer = (resp.text or "").strip()
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=GenerateContentConfig()
+    )
 
-    except Exception as e:
-        send_email(
-            "[Nerida] AI ERROR",
-            f"Session: {sid}\nError: {e}"
-        )
-        raise HTTPException(503, "AI unavailable")
-
-    if not answer:
-        answer = "NEEDS_HUMAN: true\nI could not answer this."
-
+    answer = (response.text or "").strip()
     add_msg(sid, "assistant", answer)
-    flag = needs_human(answer)
 
-    if flag:
-        body = (
-            f"Session: {sid}\n\n"
-            f"FULL CONVERSATION:\n"
+    # ========================================================
+    # 🔔 BOOKING KEYWORDS → ALWAYS NOTIFY OWNER
+    # ========================================================
+
+    booking_keywords = [
+        "book", "booking", "reserve", "availability",
+        "tomorrow", "today", "confirm", "confirmation", "date"
+    ]
+
+    needs_human = any(k in user_question.lower() for k in booking_keywords)
+
+    if needs_human:
+        CONVERSATIONS[sid]["needs_human"] = True
+
+        email_body = (
+            f"Session ID: {sid}\n\n"
+            f"FULL CONVERSATION:\n\n"
             f"{CONVERSATIONS[sid]['messages']}"
         )
-        send_email("[Nerida] Human support needed", body)
-        CONVERSATIONS[sid]["needs_human"] = True
+
+        send_email(
+            subject="[Nerida] Booking-related question (Human attention required)",
+            body=email_body
+        )
 
     return ChatResponse(
         session_id=sid,
         answer=answer,
-        needs_human=flag
+        needs_human=needs_human
     )
+
+# ============================================================
+# ADMIN ENDPOINTS
+# ============================================================
 
 @app.get("/admin/conversations", dependencies=[Depends(admin_auth)])
 async def admin_conversations():
@@ -199,4 +191,4 @@ async def admin_conversations():
 async def human_reply(session_id: str, message: str):
     add_msg(session_id, "human", message)
     CONVERSATIONS[session_id]["needs_human"] = False
-    return {"ok": True}
+    return {"ok": True}  
