@@ -253,8 +253,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
     # booking -> NEEDS HUMAN (notify)
     if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
         return (
-            f"To book, please fill this form: {FORM_URL} "
-            "(or tell me the date/time you want and I will confirm availability).",
+            f"To book, please fill this form: {FORM_URL} ",
             True,
         )
 
