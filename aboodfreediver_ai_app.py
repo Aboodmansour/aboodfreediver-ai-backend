@@ -122,9 +122,10 @@ def send_owner_email(subject: str, body: str) -> None:
             s.starttls()
             s.login(smtp_user, smtp_pass)
             s.send_message(msg)
-    except Exception:
-        # do not crash chat flow if email fails
-        return
+    except Exception as e:
+     print(f"Email notification FAILED: {type(e).__name__}: {e}")
+    return
+
 
 
 # -----------------------------
@@ -254,9 +255,27 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
     if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
         return ("Prices are here: https://www.aboodfreediver.com/Prices.php?lang=en", False)
 
-    # booking/contact
-    if any(k in q for k in ["book", "booking", "reserve", "whatsapp", "phone", "contact", "email"]):
-        return ("To book or ask details: https://www.aboodfreediver.com/form1.php", True)
+    FORM_URL = "https://www.aboodfreediver.com/form1.php"
+
+    # booking -> NEEDS HUMAN (notify)
+    if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
+        return (f"To book, please fill this form: {FORM_URL} (or tell me the date/time you want and I will confirm availability).", True)
+
+    # contact info -> NO HUMAN (no notify)
+    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]): 
+     phone = _env("CONTACT_PHONE", default="")
+    email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
+    whatsapp = _env("CONTACT_WHATSAPP", default=phone)
+
+    msg = "You can contact us here:\n"
+    if whatsapp:
+        msg += f"Phone/WhatsApp: {whatsapp}\n"
+    msg += f"Email: {email}\n"
+    msg += f"Form: {FORM_URL}"
+    return (msg, False)
+
+
+
 
     # availability/calendar
     if any(k in q for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]):
@@ -308,6 +327,31 @@ def chat(req: ChatRequest):
         {"messages": [], "needs_human": False, "created": datetime.now(timezone.utc).isoformat()},
     )
     convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
+
+        # --- RULE OVERRIDES (ADD THIS BLOCK) ---
+    q = question.lower().strip()
+    FORM_URL = "https://www.aboodfreediver.com/form1.php"
+
+    # Opening hours -> NO notify
+    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
+        hours = _env("OPENING_HOURS", default="Open daily 9:00-17:00 (Aqaba time).")
+        return ChatResponse(answer=hours, session_id=session_id, needs_human=False, source="rules")
+
+    # Contact details -> NO notify
+    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
+        phone = _env("CONTACT_PHONE", default="")
+        email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
+        whatsapp = _env("CONTACT_WHATSAPP", default=phone)
+
+        msg = "You can contact us here:\n"
+        if whatsapp:
+            msg += f"Phone/WhatsApp: {whatsapp}\n"
+        msg += f"Email: {email}\n"
+        msg += f"Form: {FORM_URL}"
+
+        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
+    # --- END RULE OVERRIDES ---
+
 
     # try gemini
     answer = try_gemini_answer(question, req.history)
