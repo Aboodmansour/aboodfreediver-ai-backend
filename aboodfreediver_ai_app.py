@@ -19,17 +19,18 @@ from pydantic import BaseModel, Field
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.3.0")
+app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: lock down in production
+    allow_origins=["*"],  # lock this down later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 security = HTTPBasic()
+
 
 # -----------------------------
 # In-memory storage (Render free tier resets on deploy/sleep)
@@ -74,10 +75,6 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 # -----------------------------
 # Admin Auth
 # -----------------------------
@@ -85,14 +82,11 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
     expected_user = _env("ADMIN_USER", "ADMIN_USERNAME")
     expected_pass = _env("ADMIN_PASS", "ADMIN_PASSWORD")
 
-    # If env vars are not set, block access (avoid accidental open admin)
-    if not expected_user or not expected_pass:
-        raise HTTPException(status_code=500, detail="Admin credentials not configured")
-
-    user_ok = secrets.compare_digest(credentials.username or "", expected_user)
-    pass_ok = secrets.compare_digest(credentials.password or "", expected_pass)
+    user_ok = secrets.compare_digest(credentials.username or "", expected_user or "")
+    pass_ok = secrets.compare_digest(credentials.password or "", expected_pass or "")
 
     if not (user_ok and pass_ok):
+        # Make browsers prompt for creds
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
@@ -102,68 +96,65 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 # -----------------------------
-# Email notify via SendGrid API (NO SMTP)
+# Email notify via SendGrid API (Render-safe: HTTPS)
 # -----------------------------
-SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
-
-
 def send_owner_email(subject: str, body: str) -> None:
     """
-    Uses SendGrid Email API (works on Render).
-    Env vars:
-      SENDGRID_API_KEY (required)
-      SMTP_FROM or SEND_FROM_EMAIL (sender email)
-      SMTP_FROM_NAME or SEND_FROM_NAME (optional)
-      OWNER_NOTIFY_EMAIL (required)
+    Uses SendGrid Email API over HTTPS.
+    Required env:
+      SENDGRID_API_KEY
+      SENDGRID_FROM  (must be a verified Single Sender or authenticated domain sender)
+      OWNER_NOTIFY_EMAIL
     """
     owner_to = _env("OWNER_NOTIFY_EMAIL")
+    if not owner_to:
+        return
+
     api_key = _env("SENDGRID_API_KEY")
-
-    # "SMTP_FROM" already exists in your Render env screenshot; reuse it
-    from_email = _env("SMTP_FROM", "SEND_FROM_EMAIL")
-    from_name = _env("SMTP_FROM_NAME", "SEND_FROM_NAME", default="Aqua Assistant")
-
-    if not owner_to or not api_key or not from_email:
+    sg_from = _env("SENDGRID_FROM", "SMTP_FROM")  # allow reusing SMTP_FROM as sender
+    if not api_key or not sg_from:
         return
 
     payload = {
-        "personalizations": [{"to": [{"email": owner_to}]}],
-        "from": {"email": from_email, "name": from_name},
-        "subject": subject,
+        "personalizations": [{"to": [{"email": owner_to}], "subject": subject}],
+        "from": {"email": sg_from},
         "content": [{"type": "text/plain", "value": body}],
     }
 
     try:
         r = requests.post(
-            SENDGRID_API_URL,
-            json=payload,
+            "https://api.sendgrid.com/v3/mail/send",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
+            json=payload,
             timeout=15,
         )
-        # 202 Accepted is success for SendGrid
-        if r.status_code not in (200, 202):
-            print(f"SendGrid email FAILED: {r.status_code} {r.text}")
+
+        # 202 is success for SendGrid
+        if r.status_code != 202:
+            print(
+                f"SendGrid FAILED: status={r.status_code} body={r.text[:500]}"
+            )
     except Exception as e:
-        print(f"SendGrid email FAILED: {type(e).__name__}: {e}")
+        print(f"SendGrid FAILED: {type(e).__name__}: {e}")
 
 
 # -----------------------------
 # Calendar check (basic scrape + cache)
 # -----------------------------
-CALENDAR_URL = _env("CALENDAR_URL", default="https://www.aboodfreediver.com/calender.php")
+CALENDAR_URL = _env("CALENDAR_URL", default="https://www.aboodfreediver.com/calendar.php")
 _calendar_cache: Dict[str, Any] = {"ts": 0.0, "events": []}
 
 
 def fetch_calendar_events() -> List[str]:
     """
-    Extract upcoming event date lines from public calendar page.
-    Cached for 10 minutes to avoid hammering site.
+    Tries to extract upcoming event date lines from your public calendar page.
+    Cached for 10 minutes.
     """
     now = time.time()
-    if now - float(_calendar_cache.get("ts", 0.0)) < 600 and isinstance(_calendar_cache.get("events"), list):
+    if now - _calendar_cache["ts"] < 600 and isinstance(_calendar_cache.get("events"), list):
         return _calendar_cache["events"]
 
     try:
@@ -175,8 +166,7 @@ def fetch_calendar_events() -> List[str]:
             r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\b",
             re.IGNORECASE,
         )
-        dates = list(dict.fromkeys(date_regex.findall(html)))  # unique, preserve order
-        dates = dates[:5]
+        dates = list(dict.fromkeys(date_regex.findall(html)))[:5]
 
         _calendar_cache["ts"] = now
         _calendar_cache["events"] = dates
@@ -211,10 +201,11 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     )
 
     dates = fetch_calendar_events()
-    if dates:
-        cal_context = "Upcoming dates from the calendar: " + ", ".join(dates)
-    else:
-        cal_context = "Calendar shows no upcoming dates (may mean mostly free; must confirm with instructor)."
+    cal_context = (
+        "Upcoming dates from the calendar: " + ", ".join(dates)
+        if dates
+        else "Calendar shows no upcoming dates (may mean mostly free; must confirm with instructor)."
+    )
 
     msgs: List[Dict[str, str]] = [{"role": "system", "content": system + "\n\n" + cal_context}]
 
@@ -233,6 +224,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
         client = genai.Client(api_key=api_key)
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
+
         resp = client.models.generate_content(model=model, contents=prompt)
         text = getattr(resp, "text", None)
         if text and str(text).strip():
@@ -263,10 +255,11 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 # -----------------------------
 def fallback_answer(question: str) -> Tuple[str, bool]:
     q = question.strip().lower()
-    FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
     if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
         return ("Prices are here: https://www.aboodfreediver.com/Prices.php?lang=en", False)
+
+    FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
     if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
         return (
@@ -287,19 +280,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
         msg += f"Form: {FORM_URL}"
         return (msg, False)
 
-    if any(
-        k in q
-        for k in [
-            "availability",
-            "available",
-            "calendar",
-            "date",
-            "dates",
-            "schedule",
-            "time slot",
-            "time are you free",
-        ]
-    ):
+    if any(k in q for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]):
         dates = fetch_calendar_events()
         if dates:
             return (
@@ -314,10 +295,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
         )
 
     if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env(
-            "OPENING_HOURS",
-            default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}",
-        )
+        hours = _env("OPENING_HOURS", default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}")
         return (hours, False)
 
     if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
@@ -342,13 +320,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
 # -----------------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "time": _utcnow_iso()}
-
-
-@app.get("/")
-def root():
-    # Render health checks often hit "/"
-    return {"ok": True, "service": "Aqua backend", "time": _utcnow_iso()}
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -361,17 +333,16 @@ def chat(req: ChatRequest):
 
     convo = CONVERSATIONS.setdefault(
         session_id,
-        {"messages": [], "needs_human": False, "created": _utcnow_iso()},
+        {"messages": [], "needs_human": False, "created": datetime.now(timezone.utc).isoformat()},
     )
-    convo["messages"].append({"role": "user", "text": question, "ts": _utcnow_iso()})
+    convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
 
     q = question.lower().strip()
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
-    # --- RULE OVERRIDES (NO NOTIFY) ---
+    # RULE OVERRIDES (NO NOTIFY)
     if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env("OPENING_HOURS", default="Open daily 09:00–17:00 (Aqaba time).")
-        convo["messages"].append({"role": "assistant", "text": hours, "ts": _utcnow_iso()})
+        hours = _env("OPENING_HOURS", default="Open daily 9:00-17:00 (Aqaba time).")
         return ChatResponse(answer=hours, session_id=session_id, needs_human=False, source="rules")
 
     if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
@@ -384,8 +355,6 @@ def chat(req: ChatRequest):
             msg += f"Phone/WhatsApp: {whatsapp}\n"
         msg += f"Email: {email}\n"
         msg += f"Form: {FORM_URL}"
-
-        convo["messages"].append({"role": "assistant", "text": msg, "ts": _utcnow_iso()})
         return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
 
     if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
@@ -397,39 +366,28 @@ def chat(req: ChatRequest):
             "- Master Freediver (Level 3)\n\n"
             "Tell me your experience level and how many days you have, and I’ll recommend the best option."
         )
-        convo["messages"].append({"role": "assistant", "text": msg, "ts": _utcnow_iso()})
         return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-    # --- END RULE OVERRIDES ---
 
+    # try gemini
     answer = try_gemini_answer(question, req.history)
     if answer:
         needs_human = any(
             k in q
             for k in [
-                "availability",
-                "available",
-                "calendar",
-                "date",
-                "dates",
-                "schedule",
-                "time slot",
-                "book",
-                "booking",
-                "reserve",
-                "reservation",
+                "availability", "available", "calendar", "date", "dates", "schedule", "time slot",
+                "book", "booking", "reserve", "reservation",
             ]
         )
-
         if needs_human:
             convo["needs_human"] = True
             send_owner_email(
                 subject="Aqua needs confirmation (availability/booking)",
                 body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
             )
-
-        convo["messages"].append({"role": "assistant", "text": answer, "ts": _utcnow_iso()})
+        convo["messages"].append({"role": "assistant", "text": answer, "ts": datetime.now(timezone.utc).isoformat()})
         return ChatResponse(answer=answer, session_id=session_id, needs_human=needs_human, source="gemini")
 
+    # fallback
     answer2, needs_human2 = fallback_answer(question)
     if needs_human2:
         convo["needs_human"] = True
@@ -437,8 +395,7 @@ def chat(req: ChatRequest):
             subject="Aqua needs confirmation (availability/booking)",
             body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
         )
-
-    convo["messages"].append({"role": "assistant", "text": answer2, "ts": _utcnow_iso()})
+    convo["messages"].append({"role": "assistant", "text": answer2, "ts": datetime.now(timezone.utc).isoformat()})
     return ChatResponse(answer=answer2, session_id=session_id, needs_human=needs_human2, source="fallback")
 
 
@@ -456,7 +413,7 @@ def human_reply(data: HumanReply, _: bool = Depends(admin_auth)):
     if not convo:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    convo["messages"].append({"role": "human", "text": data.message, "ts": _utcnow_iso()})
+    convo["messages"].append({"role": "human", "text": data.message, "ts": datetime.now(timezone.utc).isoformat()})
     convo["needs_human"] = False
     return {"ok": True}
 
