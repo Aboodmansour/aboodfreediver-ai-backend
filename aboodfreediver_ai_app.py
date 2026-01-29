@@ -4,8 +4,10 @@ import os
 import re
 import uuid
 import time
+import html as html_lib
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
+from urllib.parse import urljoin
 
 import secrets
 import requests
@@ -15,11 +17,10 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
-
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.2.1")
+app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,7 +32,6 @@ app.add_middleware(
 
 security = HTTPBasic()
 
-
 # -----------------------------
 # In-memory storage (Render free tier resets on deploy/sleep)
 # -----------------------------
@@ -41,7 +41,6 @@ CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
 #   "needs_human": bool,
 #   "created": iso,
 # }
-
 
 # -----------------------------
 # Models
@@ -56,7 +55,7 @@ class ChatResponse(BaseModel):
     answer: str
     session_id: str
     needs_human: bool = False
-    source: str = "fallback"  # "gemini" or "fallback" or "rules"
+    source: str = "gemini"  # "gemini" or "fallback"
 
 
 class HumanReply(BaseModel):
@@ -86,7 +85,6 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
     pass_ok = secrets.compare_digest(credentials.password or "", expected_pass or "")
 
     if not (user_ok and pass_ok):
-        # Make browsers prompt for creds
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
@@ -131,12 +129,8 @@ def send_owner_email(subject: str, body: str) -> None:
             json=payload,
             timeout=15,
         )
-
-        # 202 is success for SendGrid
         if r.status_code != 202:
-            print(
-                f"SendGrid FAILED: status={r.status_code} body={r.text[:500]}"
-            )
+            print(f"SendGrid FAILED: status={r.status_code} body={r.text[:500]}")
     except Exception as e:
         print(f"SendGrid FAILED: {type(e).__name__}: {e}")
 
@@ -178,6 +172,181 @@ def fetch_calendar_events() -> List[str]:
 
 
 # -----------------------------
+# Retrieval: site -> blog -> web
+# -----------------------------
+SITE_BASE_URL = _env("SITE_BASE_URL", default="https://www.aboodfreediver.com")
+SITE_SITEMAP_URL = _env("SITE_SITEMAP_URL", default=urljoin(SITE_BASE_URL, "/sitemap.xml"))
+BLOG_SITEMAP_URL = _env("BLOG_SITEMAP_URL", default="")
+
+_retrieval_cache: Dict[str, Any] = {
+    "ts": 0.0,
+    "site_urls": [],
+    "blog_urls": [],
+}
+
+
+def _fetch_sitemap_urls(sitemap_url: str, limit: int = 400) -> List[str]:
+    if not sitemap_url:
+        return []
+    try:
+        r = requests.get(sitemap_url, timeout=15, headers={"User-Agent": "AquaBot/1.0"})
+        r.raise_for_status()
+        xml = r.text
+
+        urls = re.findall(r"<loc>\s*(.*?)\s*</loc>", xml, flags=re.IGNORECASE)
+        urls = [u.strip() for u in urls if u.strip().startswith("http")]
+
+        seen = set()
+        out: List[str] = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _refresh_url_lists_if_needed() -> None:
+    now = time.time()
+    if now - float(_retrieval_cache.get("ts", 0.0)) < 3600 and _retrieval_cache.get("site_urls"):
+        return
+
+    site_urls = _fetch_sitemap_urls(SITE_SITEMAP_URL, limit=500)
+    blog_urls: List[str] = _fetch_sitemap_urls(BLOG_SITEMAP_URL, limit=500) if BLOG_SITEMAP_URL else []
+
+    _retrieval_cache["site_urls"] = site_urls
+    _retrieval_cache["blog_urls"] = blog_urls
+    _retrieval_cache["ts"] = now
+
+
+def _clean_text_from_html(html_text: str) -> str:
+    html_text = re.sub(r"(?is)<script.*?>.*?</script>", " ", html_text)
+    html_text = re.sub(r"(?is)<style.*?>.*?</style>", " ", html_text)
+    text = re.sub(r"(?s)<[^>]+>", " ", html_text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _score_text(question: str, text: str) -> int:
+    q_words = re.findall(r"[a-zA-Z0-9]+", question.lower())
+    q_words = [w for w in q_words if len(w) >= 3]
+    if not q_words:
+        return 0
+    t = text.lower()
+    return sum(1 for w in q_words if w in t)
+
+
+def _search_urls_for_context(
+    question: str,
+    urls: List[str],
+    per_url_chars: int = 1400,
+    max_hits: int = 4,
+    hard_limit_urls: int = 350,
+) -> List[Dict[str, str]]:
+    hits: List[Tuple[int, str, str]] = []
+    for u in urls[:hard_limit_urls]:
+        try:
+            r = requests.get(u, timeout=12, headers={"User-Agent": "AquaBot/1.0"})
+            if r.status_code >= 400:
+                continue
+            text = _clean_text_from_html(r.text)
+            if not text:
+                continue
+            s = _score_text(question, text)
+            if s <= 0:
+                continue
+            snippet = text[:per_url_chars]
+            hits.append((s, u, snippet))
+        except Exception:
+            continue
+
+    hits.sort(key=lambda x: x[0], reverse=True)
+    return [{"url": u, "snippet": snip} for _, u, snip in hits[:max_hits]]
+
+
+def web_search_context(question: str) -> List[Dict[str, str]]:
+    """
+    Web search requires ONE option:
+      - SERPAPI_KEY
+      - GOOGLE_CSE_API_KEY + GOOGLE_CSE_CX
+    Returns list of {url, snippet}
+    """
+    serpapi_key = _env("SERPAPI_KEY")
+    if serpapi_key:
+        try:
+            r = requests.get(
+                "https://serpapi.com/search.json",
+                timeout=15,
+                params={"engine": "google", "q": question, "api_key": serpapi_key, "num": 5},
+            )
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("organic_results", [])[:4]
+            out: List[Dict[str, str]] = []
+            for it in results:
+                link = it.get("link")
+                snippet = it.get("snippet") or it.get("title") or ""
+                if link:
+                    out.append({"url": link, "snippet": snippet})
+            return out
+        except Exception:
+            return []
+
+    cse_key = _env("GOOGLE_CSE_API_KEY")
+    cse_cx = _env("GOOGLE_CSE_CX")
+    if cse_key and cse_cx:
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                timeout=15,
+                params={"key": cse_key, "cx": cse_cx, "q": question, "num": 5},
+            )
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("items", [])[:4]
+            out: List[Dict[str, str]] = []
+            for it in items:
+                link = it.get("link")
+                snippet = it.get("snippet") or it.get("title") or ""
+                if link:
+                    out.append({"url": link, "snippet": snippet})
+            return out
+        except Exception:
+            return []
+
+    return []
+
+
+def retrieve_context(question: str) -> Dict[str, Any]:
+    """
+    Priority:
+      1) SITE (SITE_SITEMAP_URL)
+      2) BLOG (BLOG_SITEMAP_URL)
+      3) WEB (SerpAPI or Google CSE)
+    """
+    _refresh_url_lists_if_needed()
+
+    site_hits = _search_urls_for_context(question, _retrieval_cache.get("site_urls", []))
+    if site_hits:
+        return {"source": "site", "items": site_hits}
+
+    blog_urls = _retrieval_cache.get("blog_urls", [])
+    blog_hits = _search_urls_for_context(question, blog_urls) if blog_urls else []
+    if blog_hits:
+        return {"source": "blog", "items": blog_hits}
+
+    web_hits = web_search_context(question)
+    if web_hits:
+        return {"source": "web", "items": web_hits}
+
+    return {"source": "none", "items": []}
+
+
+# -----------------------------
 # Gemini (supports either new or old SDK)
 # -----------------------------
 def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
@@ -187,19 +356,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
 
-    system = (
-        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\n"
-        "Rules:\n"
-        "1) Be brief, clear, helpful.\n"
-        "2) If the user asks about prices, link to: https://www.aboodfreediver.com/Prices.php?lang=en\n"
-        "3) If the user asks about contact/booking, link to: https://www.aboodfreediver.com/form1.php\n"
-        "4) If the user asks about availability/dates:\n"
-        "   - If calendar has events, mention the next dates.\n"
-        "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n"
-        "5) If user asks opening hours, answer with the standard hours the instructor uses (if unknown, ask them to contact).\n"
-        "6) If uncertain, ask 1 short follow-up question.\n"
-    )
-
+    # calendar context
     dates = fetch_calendar_events()
     cal_context = (
         "Upcoming dates from the calendar: " + ", ".join(dates)
@@ -207,7 +364,34 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         else "Calendar shows no upcoming dates (may mean mostly free; must confirm with instructor)."
     )
 
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": system + "\n\n" + cal_context}]
+    # retrieval context (site -> blog -> web)
+    rc = retrieve_context(question)
+    context_blocks: List[str] = [cal_context]
+    if rc.get("items"):
+        label = str(rc.get("source", "context")).upper()
+        joined = "\n".join([f"- {it['url']}\n  {it['snippet']}" for it in rc["items"]])
+        context_blocks.append(f"{label} CONTEXT:\n{joined}")
+
+    system = (
+        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\n"
+        "\n"
+        "You MUST follow this priority when answering:\n"
+        "1) Use SITE CONTEXT first.\n"
+        "2) If insufficient, use BLOG CONTEXT.\n"
+        "3) If still insufficient, use WEB CONTEXT.\n"
+        "\n"
+        "If you use any context, cite the URL(s) you used.\n"
+        "If uncertain, ask ONE short follow-up question.\n"
+        "Be brief, clear, and helpful.\n"
+        "\n"
+        "Hard links:\n"
+        "- Prices: https://www.aboodfreediver.com/Prices.php?lang=en\n"
+        "- Booking/contact form: https://www.aboodfreediver.com/form1.php\n"
+    )
+
+    msgs: List[Dict[str, str]] = [
+        {"role": "system", "content": system + "\n\n" + "\n\n".join(context_blocks)}
+    ]
 
     if history:
         for m in history[-12:]:
@@ -224,7 +408,6 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
         client = genai.Client(api_key=api_key)
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
-
         resp = client.models.generate_content(model=model, contents=prompt)
         text = getattr(resp, "text", None)
         if text and str(text).strip():
@@ -237,7 +420,10 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         import google.generativeai as genai_old  # type: ignore
 
         genai_old.configure(api_key=api_key)
-        gm = genai_old.GenerativeModel(model_name=model, system_instruction=system + "\n\n" + cal_context)
+        gm = genai_old.GenerativeModel(
+            model_name=model,
+            system_instruction=system + "\n\n" + "\n\n".join(context_blocks),
+        )
 
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs if m["role"] != "system"])
         r = gm.generate_content(prompt)
@@ -251,68 +437,17 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
 
 # -----------------------------
-# Fallback logic
+# Fallback logic (only if Gemini fails)
 # -----------------------------
 def fallback_answer(question: str) -> Tuple[str, bool]:
     q = question.strip().lower()
+    form_url = "https://www.aboodfreediver.com/form1.php"
 
-    if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
-        return ("Prices are here: https://www.aboodfreediver.com/Prices.php?lang=en", False)
+    # keep it minimal: Gemini should handle most cases
+    if any(k in q for k in ["book", "booking", "reserve", "reservation", "availability", "available", "calendar", "date", "dates"]):
+        return (f"Please share the day/time you want. You can also use the booking form: {form_url}", True)
 
-    FORM_URL = "https://www.aboodfreediver.com/form1.php"
-
-    if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
-        return (
-            f"To book, please fill this form: {FORM_URL} "
-            "(or tell me the date/time you want and I will confirm availability).",
-            True,
-        )
-
-    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
-        phone = _env("CONTACT_PHONE", default="")
-        email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
-        whatsapp = _env("CONTACT_WHATSAPP", default=phone)
-
-        msg = "You can contact us here:\n"
-        if whatsapp:
-            msg += f"Phone/WhatsApp: {whatsapp}\n"
-        msg += f"Email: {email}\n"
-        msg += f"Form: {FORM_URL}"
-        return (msg, False)
-
-    if any(k in q for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]):
-        dates = fetch_calendar_events()
-        if dates:
-            return (
-                "Upcoming calendar dates: " + ", ".join(dates) + ". "
-                "Tell me the day/time you want and I’ll confirm with the instructor.",
-                True,
-            )
-        return (
-            "We’re usually free if nothing is scheduled on the calendar, but I must confirm with the instructor first. "
-            "Tell me the day/time you want.",
-            True,
-        )
-
-    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env("OPENING_HOURS", default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}")
-        return (hours, False)
-
-    if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
-        return (
-            "We offer freediving courses for all levels:\n"
-            "- Discovery Freediver (beginner try)\n"
-            "- Freediver (Level 1)\n"
-            "- Advanced Freediver (Level 2)\n"
-            "- Master Freediver (Level 3)\n\n"
-            "Tell me your experience level and how many days you have, and I’ll recommend the best option.",
-            False,
-        )
-
-    if any(k in q for k in ["hello", "hi", "hey", "good morning", "good evening"]):
-        return ("Hi, I’m Aqua. Ask me about courses, prices, safety, or availability in Aqaba.", False)
-
-    return ("Ask me about freediving courses, prices, safety, or availability in Aqaba.", False)
+    return ("Please tell me what you need (course, prices, safety, equipment, or availability).", False)
 
 
 # -----------------------------
@@ -338,37 +473,8 @@ def chat(req: ChatRequest):
     convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
 
     q = question.lower().strip()
-    FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
-    # RULE OVERRIDES (NO NOTIFY)
-    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env("OPENING_HOURS", default="Open daily 9:00-17:00 (Aqaba time).")
-        return ChatResponse(answer=hours, session_id=session_id, needs_human=False, source="rules")
-
-    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
-        phone = _env("CONTACT_PHONE", default="")
-        email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
-        whatsapp = _env("CONTACT_WHATSAPP", default=phone)
-
-        msg = "You can contact us here:\n"
-        if whatsapp:
-            msg += f"Phone/WhatsApp: {whatsapp}\n"
-        msg += f"Email: {email}\n"
-        msg += f"Form: {FORM_URL}"
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-
-    if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
-        msg = (
-            "We offer freediving courses for all levels:\n"
-            "- Discovery Freediver (beginner try)\n"
-            "- Freediver (Level 1)\n"
-            "- Advanced Freediver (Level 2)\n"
-            "- Master Freediver (Level 3)\n\n"
-            "Tell me your experience level and how many days you have, and I’ll recommend the best option."
-        )
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-
-    # try gemini
+    # Gemini answers EVERYTHING (site -> blog -> web context is injected inside try_gemini_answer)
     answer = try_gemini_answer(question, req.history)
     if answer:
         needs_human = any(
@@ -378,16 +484,18 @@ def chat(req: ChatRequest):
                 "book", "booking", "reserve", "reservation",
             ]
         )
+
         if needs_human:
             convo["needs_human"] = True
             send_owner_email(
                 subject="Aqua needs confirmation (availability/booking)",
                 body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
             )
+
         convo["messages"].append({"role": "assistant", "text": answer, "ts": datetime.now(timezone.utc).isoformat()})
         return ChatResponse(answer=answer, session_id=session_id, needs_human=needs_human, source="gemini")
 
-    # fallback
+    # fallback only if Gemini fails completely
     answer2, needs_human2 = fallback_answer(question)
     if needs_human2:
         convo["needs_human"] = True
