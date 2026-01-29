@@ -44,6 +44,7 @@ CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
 #   "created": iso,
 # }
 
+
 # -----------------------------
 # Models
 # -----------------------------
@@ -57,7 +58,7 @@ class ChatResponse(BaseModel):
     answer: str
     session_id: str
     needs_human: bool = False
-    source: str = "fallback"  # "gemini" or "fallback"
+    source: str = "fallback"  # "gemini" or "fallback" or "rules"
 
 
 class HumanReply(BaseModel):
@@ -84,7 +85,6 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
     pass_ok = secrets.compare_digest(credentials.password or "", expected_pass or "")
 
     if not (user_ok and pass_ok):
-        # Forces browser to show login popup
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
 
@@ -123,16 +123,15 @@ def send_owner_email(subject: str, body: str) -> None:
             s.login(smtp_user, smtp_pass)
             s.send_message(msg)
     except Exception as e:
-     print(f"Email notification FAILED: {type(e).__name__}: {e}")
-    return
-
+        # do not crash chat flow if email fails
+        print(f"Email notification FAILED: {type(e).__name__}: {e}")
+        return
 
 
 # -----------------------------
 # Calendar check (basic scrape + cache)
 # -----------------------------
 CALENDAR_URL = _env("CALENDAR_URL", default="https://www.aboodfreediver.com/calender.php")
-
 _calendar_cache: Dict[str, Any] = {"ts": 0.0, "events": []}
 
 
@@ -151,8 +150,6 @@ def fetch_calendar_events() -> List[str]:
         r.raise_for_status()
         html = r.text
 
-        # Example seen on your page screenshot: "Sat, May 2, 2026"
-        # We'll capture a few date-like strings.
         date_regex = re.compile(
             r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\b",
             re.IGNORECASE,
@@ -192,16 +189,13 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         "6) If uncertain, ask 1 short follow-up question.\n"
     )
 
-    # Add calendar context
     dates = fetch_calendar_events()
     if dates:
         cal_context = "Upcoming dates from the calendar: " + ", ".join(dates)
     else:
         cal_context = "Calendar shows no upcoming dates (may mean mostly free; must confirm with instructor)."
 
-    # Build message list
-    msgs: List[Dict[str, str]] = []
-    msgs.append({"role": "system", "content": system + "\n\n" + cal_context})
+    msgs: List[Dict[str, str]] = [{"role": "system", "content": system + "\n\n" + cal_context}]
 
     if history:
         for m in history[-12:]:
@@ -217,7 +211,6 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         from google import genai  # type: ignore
 
         client = genai.Client(api_key=api_key)
-        # Convert to a single prompt for compatibility
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
 
         resp = client.models.generate_content(model=model, contents=prompt)
@@ -232,10 +225,10 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         import google.generativeai as genai_old  # type: ignore
 
         genai_old.configure(api_key=api_key)
-        m = genai_old.GenerativeModel(model_name=model, system_instruction=system + "\n\n" + cal_context)
+        gm = genai_old.GenerativeModel(model_name=model, system_instruction=system + "\n\n" + cal_context)
 
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs if m["role"] != "system"])
-        r = m.generate_content(prompt)
+        r = gm.generate_content(prompt)
         text = getattr(r, "text", None)
         if text and str(text).strip():
             return str(text).strip()
@@ -246,7 +239,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
 
 # -----------------------------
-# Fallback logic (smarter than “stupid” answers)
+# Fallback logic
 # -----------------------------
 def fallback_answer(question: str) -> Tuple[str, bool]:
     q = question.strip().lower()
@@ -259,31 +252,44 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
 
     # booking -> NEEDS HUMAN (notify)
     if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
-        return (f"To book, please fill this form: {FORM_URL} (or tell me the date/time you want and I will confirm availability).", True)
+        return (
+            f"To book, please fill this form: {FORM_URL} "
+            "(or tell me the date/time you want and I will confirm availability).",
+            True,
+        )
 
     # contact info -> NO HUMAN (no notify)
-    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]): 
-     phone = _env("CONTACT_PHONE", default="")
-    email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
-    whatsapp = _env("CONTACT_WHATSAPP", default=phone)
+    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
+        phone = _env("CONTACT_PHONE", default="")
+        email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
+        whatsapp = _env("CONTACT_WHATSAPP", default=phone)
 
-    msg = "You can contact us here:\n"
-    if whatsapp:
-        msg += f"Phone/WhatsApp: {whatsapp}\n"
-    msg += f"Email: {email}\n"
-    msg += f"Form: {FORM_URL}"
-    return (msg, False)
+        msg = "You can contact us here:\n"
+        if whatsapp:
+            msg += f"Phone/WhatsApp: {whatsapp}\n"
+        msg += f"Email: {email}\n"
+        msg += f"Form: {FORM_URL}"
+        return (msg, False)
 
-
-
-
-    # availability/calendar
-    if any(k in q for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]):
+    # availability/calendar -> NEEDS HUMAN (notify)
+    if any(
+        k in q
+        for k in [
+            "availability",
+            "available",
+            "calendar",
+            "date",
+            "dates",
+            "schedule",
+            "time slot",
+            "time are you free",
+        ]
+    ):
         dates = fetch_calendar_events()
         if dates:
             return (
                 "Upcoming calendar dates: " + ", ".join(dates) + ". "
-                "If you want a specific time/day, tell me and I’ll confirm with the instructor.",
+                "Tell me the day/time you want and I’ll confirm with the instructor.",
                 True,
             )
         return (
@@ -292,10 +298,25 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
             True,
         )
 
-    # opening hours (set yours via OPENING_HOURS env var)
+    # opening hours -> NO HUMAN (no notify)
     if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env("OPENING_HOURS", default="Please message us to confirm today’s opening hours: https://www.aboodfreediver.com/form1.php")
+        hours = _env(
+            "OPENING_HOURS",
+            default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}",
+        )
         return (hours, False)
+
+    # courses -> NO HUMAN (no notify) (clear answer)
+    if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
+        return (
+            "We offer freediving courses for all levels:\n"
+            "- Discovery Freediver (beginner try)\n"
+            "- Freediver (Level 1)\n"
+            "- Advanced Freediver (Level 2)\n"
+            "- Master Freediver (Level 3)\n\n"
+            "Tell me your experience level and how many days you have, and I’ll recommend the best option.",
+            False,
+        )
 
     # greeting
     if any(k in q for k in ["hello", "hi", "hey", "good morning", "good evening"]):
@@ -328,7 +349,7 @@ def chat(req: ChatRequest):
     )
     convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
 
-        # --- RULE OVERRIDES (ADD THIS BLOCK) ---
+    # --- RULE OVERRIDES (NO NOTIFY) ---
     q = question.lower().strip()
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
@@ -350,13 +371,39 @@ def chat(req: ChatRequest):
         msg += f"Form: {FORM_URL}"
 
         return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-    # --- END RULE OVERRIDES ---
 
+    # Courses -> NO notify (clear)
+    if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
+        msg = (
+            "We offer freediving courses for all levels:\n"
+            "- Discovery Freediver (beginner try)\n"
+            "- Freediver (Level 1)\n"
+            "- Advanced Freediver (Level 2)\n"
+            "- Master Freediver (Level 3)\n\n"
+            "Tell me your experience level and how many days you have, and I’ll recommend the best option."
+        )
+        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
+    # --- END RULE OVERRIDES ---
 
     # try gemini
     answer = try_gemini_answer(question, req.history)
     if answer:
-        needs_human = any(k in question.lower() for k in ["availability", "available", "book", "booking", "reserve", "date", "dates", "schedule"])
+        needs_human = any(
+            k in q
+            for k in [
+                "availability",
+                "available",
+                "calendar",
+                "date",
+                "dates",
+                "schedule",
+                "time slot",
+                "book",
+                "booking",
+                "reserve",
+                "reservation",
+            ]
+        )
         if needs_human:
             convo["needs_human"] = True
             send_owner_email(
