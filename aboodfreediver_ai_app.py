@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.2.0")
+app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +32,6 @@ app.add_middleware(
 )
 
 security = HTTPBasic()
-
 
 # -----------------------------
 # In-memory storage (Render free tier resets on deploy/sleep)
@@ -67,7 +66,7 @@ class HumanReply(BaseModel):
 
 
 # -----------------------------
-# Admin Auth (supports both env var naming styles)
+# Helpers
 # -----------------------------
 def _env(*names: str, default: str = "") -> str:
     for n in names:
@@ -77,6 +76,70 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _add_message(session_id: str, role: str, text: str) -> None:
+    convo = CONVERSATIONS.setdefault(
+        session_id,
+        {"messages": [], "needs_human": False, "created": _now_iso()},
+    )
+    convo["messages"].append({"role": role, "text": text, "ts": _now_iso()})
+
+
+def _finalize_response(
+    session_id: str,
+    answer: str,
+    needs_human: bool,
+    source: str,
+) -> ChatResponse:
+    # store assistant message BEFORE returning
+    _add_message(session_id, "assistant", answer)
+
+    if needs_human:
+        convo = CONVERSATIONS.setdefault(
+            session_id,
+            {"messages": [], "needs_human": False, "created": _now_iso()},
+        )
+        convo["needs_human"] = True
+
+    return ChatResponse(answer=answer, session_id=session_id, needs_human=needs_human, source=source)
+
+
+def _is_booking_or_availability(q: str) -> bool:
+    q = q.lower()
+
+    booking_keywords = [
+        "book", "booking", "reserve", "reservation", "register", "sign up", "join",
+        "price for tomorrow",  # common phrasing
+    ]
+    availability_keywords = [
+        "availability", "available", "calendar", "schedule", "time slot",
+        "date", "dates", "when", "are you free",
+        "today", "tomorrow", "tonight", "this week", "next week", "weekend",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    ]
+
+    # If user mentions booking words OR time/date intent => needs human confirmation
+    if any(k in q for k in booking_keywords):
+        return True
+    if any(k in q for k in availability_keywords) and any(
+        x in q for x in ["book", "course", "session", "training", "class", "fun", "discover", "freedive", "freediving"]
+    ):
+        return True
+
+    # Many users write: "I want to book a freediving course tomorrow"
+    # This contains "course" and "tomorrow" but might miss booking word if typo.
+    if "tomorrow" in q and any(x in q for x in ["course", "session", "training", "freedive", "freediving"]):
+        return True
+
+    return False
+
+
+# -----------------------------
+# Admin Auth
+# -----------------------------
 def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
     expected_user = _env("ADMIN_USER", "ADMIN_USERNAME")
     expected_pass = _env("ADMIN_PASS", "ADMIN_PASSWORD")
@@ -90,13 +153,21 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 # -----------------------------
-# Email notify (optional)
+# Email notify
 # -----------------------------
 def send_owner_email(subject: str, body: str) -> None:
     """
     Uses SMTP_* env vars:
       SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM
     Sends to OWNER_NOTIFY_EMAIL.
+
+    For Gmail (recommended):
+      SMTP_HOST=smtp.gmail.com
+      SMTP_PORT=587
+      SMTP_USER=aboodfreediver@gmail.com
+      SMTP_PASSWORD=<GMAIL_APP_PASSWORD>   (NOT your normal password)
+      SMTP_FROM=aboodfreediver@gmail.com
+      OWNER_NOTIFY_EMAIL=aboodfreediver@gmail.com
     """
     owner_to = _env("OWNER_NOTIFY_EMAIL")
     if not owner_to:
@@ -123,24 +194,18 @@ def send_owner_email(subject: str, body: str) -> None:
             s.login(smtp_user, smtp_pass)
             s.send_message(msg)
     except Exception as e:
-        # do not crash chat flow if email fails
         print(f"Email notification FAILED: {type(e).__name__}: {e}")
         return
 
 
 # -----------------------------
-# Calendar check (basic scrape + cache)
+# Calendar check (scrape + cache)
 # -----------------------------
 CALENDAR_URL = _env("CALENDAR_URL", default="https://www.aboodfreediver.com/calender.php")
 _calendar_cache: Dict[str, Any] = {"ts": 0.0, "events": []}
 
 
 def fetch_calendar_events() -> List[str]:
-    """
-    Tries to extract upcoming event date lines from your public calendar page.
-    If it can't find any, returns [].
-    Cached for 10 minutes to avoid hammering your site.
-    """
     now = time.time()
     if now - _calendar_cache["ts"] < 600 and isinstance(_calendar_cache.get("events"), list):
         return _calendar_cache["events"]
@@ -167,7 +232,7 @@ def fetch_calendar_events() -> List[str]:
 
 
 # -----------------------------
-# Gemini (supports either new or old SDK)
+# Gemini
 # -----------------------------
 def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
     api_key = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
@@ -206,13 +271,12 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     msgs.append({"role": "user", "content": question})
 
-    # --- Try new SDK first: google-genai ---
+    # New SDK: google-genai
     try:
         from google import genai  # type: ignore
 
         client = genai.Client(api_key=api_key)
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
-
         resp = client.models.generate_content(model=model, contents=prompt)
         text = getattr(resp, "text", None)
         if text and str(text).strip():
@@ -220,7 +284,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     except Exception:
         pass
 
-    # --- Fallback old SDK: google-generativeai ---
+    # Old SDK: google-generativeai
     try:
         import google.generativeai as genai_old  # type: ignore
 
@@ -243,21 +307,32 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 # -----------------------------
 def fallback_answer(question: str) -> Tuple[str, bool]:
     q = question.strip().lower()
+    FORM_URL = "https://www.aboodfreediver.com/form1.php"
+
+    # booking / availability must be checked BEFORE "courses"
+    if _is_booking_or_availability(q):
+        dates = fetch_calendar_events()
+        if dates:
+            return (
+                "To book, please fill this form: "
+                f"{FORM_URL}\n\n"
+                "Upcoming calendar dates: " + ", ".join(dates) + ".\n"
+                "Tell me the day/time you want and I’ll confirm with the instructor.",
+                True,
+            )
+        return (
+            "To book, please fill this form: "
+            f"{FORM_URL}\n\n"
+            "We’re usually free if nothing is scheduled on the calendar, but I must confirm with the instructor first.\n"
+            "Tell me the day/time you want.",
+            True,
+        )
 
     # prices
     if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
         return ("Prices are here: https://www.aboodfreediver.com/Prices.php?lang=en", False)
 
-    FORM_URL = "https://www.aboodfreediver.com/form1.php"
-
-    # booking -> NEEDS HUMAN (notify)
-    if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
-        return (
-            f"To book, please fill this form: {FORM_URL} ",
-            True,
-        )
-
-    # contact info -> NO HUMAN (no notify)
+    # contact info
     if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
         phone = _env("CONTACT_PHONE", default="")
         email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
@@ -270,34 +345,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
         msg += f"Form: {FORM_URL}"
         return (msg, False)
 
-    # availability/calendar -> NEEDS HUMAN (notify)
-    if any(
-        k in q
-        for k in [
-            "availability",
-            "available",
-            "calendar",
-            "date",
-            "dates",
-            "schedule",
-            "time slot",
-            "time are you free",
-        ]
-    ):
-        dates = fetch_calendar_events()
-        if dates:
-            return (
-                "Upcoming calendar dates: " + ", ".join(dates) + ". "
-                "Tell me the day/time you want and I’ll confirm with the instructor.",
-                True,
-            )
-        return (
-            "We’re usually free if nothing is scheduled on the calendar, but I must confirm with the instructor first. "
-            "Tell me the day/time you want.",
-            True,
-        )
-
-    # opening hours -> NO HUMAN (no notify)
+    # opening hours
     if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
         hours = _env(
             "OPENING_HOURS",
@@ -305,7 +353,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
         )
         return (hours, False)
 
-    # courses -> NO HUMAN (no notify) (clear answer)
+    # courses (clear answer)
     if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
         return (
             "We offer freediving courses for all levels:\n"
@@ -330,7 +378,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
 # -----------------------------
 @app.get("/health")
 def health():
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+    return {"ok": True, "time": _now_iso()}
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -341,23 +389,42 @@ def chat(req: ChatRequest):
 
     session_id = (req.session_id or "").strip() or str(uuid.uuid4())
 
-    # store conversation
-    convo = CONVERSATIONS.setdefault(
-        session_id,
-        {"messages": [], "needs_human": False, "created": datetime.now(timezone.utc).isoformat()},
-    )
-    convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
+    # store user message
+    _add_message(session_id, "user", question)
 
-    # --- RULE OVERRIDES (NO NOTIFY) ---
     q = question.lower().strip()
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
-    # Opening hours -> NO notify
+    # 1) HARD RULE: booking/availability ALWAYS needs human + email
+    # This prevents Gemini from answering a "courses list" when user wants to book tomorrow.
+    if _is_booking_or_availability(q):
+        dates = fetch_calendar_events()
+        if dates:
+            answer = (
+                f"To book, please fill this form: {FORM_URL}\n\n"
+                "Upcoming calendar dates: " + ", ".join(dates) + ".\n"
+                "Tell me the day/time you want and I’ll confirm with the instructor."
+            )
+        else:
+            answer = (
+                f"To book, please fill this form: {FORM_URL}\n\n"
+                "We’re usually free if nothing is scheduled on the calendar, but I must confirm with the instructor first.\n"
+                "Tell me the day/time you want."
+            )
+
+        # mark + email notify
+        CONVERSATIONS.setdefault(session_id, {"messages": [], "needs_human": False, "created": _now_iso()})["needs_human"] = True
+        send_owner_email(
+            subject="Aqua needs confirmation (availability/booking)",
+            body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
+        )
+        return _finalize_response(session_id, answer, needs_human=True, source="rules")
+
+    # 2) RULE OVERRIDES (NO NOTIFY)
     if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
         hours = _env("OPENING_HOURS", default="Open daily 9:00-17:00 (Aqaba time).")
-        return ChatResponse(answer=hours, session_id=session_id, needs_human=False, source="rules")
+        return _finalize_response(session_id, hours, needs_human=False, source="rules")
 
-    # Contact details -> NO notify
     if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
         phone = _env("CONTACT_PHONE", default="")
         email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
@@ -368,10 +435,8 @@ def chat(req: ChatRequest):
             msg += f"Phone/WhatsApp: {whatsapp}\n"
         msg += f"Email: {email}\n"
         msg += f"Form: {FORM_URL}"
+        return _finalize_response(session_id, msg, needs_human=False, source="rules")
 
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-
-    # Courses -> NO notify (clear)
     if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
         msg = (
             "We offer freediving courses for all levels:\n"
@@ -381,47 +446,23 @@ def chat(req: ChatRequest):
             "- Master Freediver (Level 3)\n\n"
             "Tell me your experience level and how many days you have, and I’ll recommend the best option."
         )
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-    # --- END RULE OVERRIDES ---
+        return _finalize_response(session_id, msg, needs_human=False, source="rules")
 
-    # try gemini
+    # 3) Try Gemini
     answer = try_gemini_answer(question, req.history)
     if answer:
-        needs_human = any(
-            k in q
-            for k in [
-                "availability",
-                "available",
-                "calendar",
-                "date",
-                "dates",
-                "schedule",
-                "time slot",
-                "book",
-                "booking",
-                "reserve",
-                "reservation",
-            ]
-        )
-        if needs_human:
-            convo["needs_human"] = True
-            send_owner_email(
-                subject="Aqua needs confirmation (availability/booking)",
-                body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
-            )
-        convo["messages"].append({"role": "assistant", "text": answer, "ts": datetime.now(timezone.utc).isoformat()})
-        return ChatResponse(answer=answer, session_id=session_id, needs_human=needs_human, source="gemini")
+        # Gemini normal answers do not trigger notify unless booking/availability (already handled above)
+        return _finalize_response(session_id, answer, needs_human=False, source="gemini")
 
-    # fallback
+    # 4) fallback
     answer2, needs_human2 = fallback_answer(question)
     if needs_human2:
-        convo["needs_human"] = True
+        CONVERSATIONS.setdefault(session_id, {"messages": [], "needs_human": False, "created": _now_iso()})["needs_human"] = True
         send_owner_email(
             subject="Aqua needs confirmation (availability/booking)",
             body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
         )
-    convo["messages"].append({"role": "assistant", "text": answer2, "ts": datetime.now(timezone.utc).isoformat()})
-    return ChatResponse(answer=answer2, session_id=session_id, needs_human=needs_human2, source="fallback")
+    return _finalize_response(session_id, answer2, needs_human=needs_human2, source="fallback")
 
 
 @app.get("/chat/status")
@@ -429,7 +470,7 @@ def chat_status(session_id: str):
     convo = CONVERSATIONS.get(session_id)
     if not convo:
         return {"messages": [], "needs_human": False}
-    return {"messages": convo["messages"], "needs_human": convo["needs_human"]}
+    return {"messages": convo["messages"], "needs_human": bool(convo.get("needs_human"))}
 
 
 @app.post("/human")
@@ -438,7 +479,7 @@ def human_reply(data: HumanReply, _: bool = Depends(admin_auth)):
     if not convo:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    convo["messages"].append({"role": "human", "text": data.message, "ts": datetime.now(timezone.utc).isoformat()})
+    _add_message(data.session_id, "human", data.message)
     convo["needs_human"] = False
     return {"ok": True}
 
