@@ -9,6 +9,9 @@ from typing import Dict, List, Optional, Any, Tuple
 
 import secrets
 import requests
+from urllib.parse import urljoin
+import html as html_lib
+
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -76,6 +79,177 @@ def _env(*names: str, default: str = "") -> str:
 
 
 # -----------------------------
+# Site/Blog Retrieval Helpers (site -> blog -> (optional web later))
+# -----------------------------
+BASE_SITE = _env("BASE_SITE_URL", "SITE_BASE_URL", default="https://www.aboodfreediver.com/")
+if not BASE_SITE.endswith("/"):
+    BASE_SITE += "/"
+
+# Your env uses BLOG_SITEMAP_URL and it points to blog.html (works as blog index)
+BLOG_INDEX_URL = _env("BLOG_SITEMAP_URL", default=urljoin(BASE_SITE, "blog.html"))
+
+_PAGE_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": float, "text": str}
+_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
+
+
+def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
+    """
+    Uses SearchApi.io Google Search API.
+    Auth: api_key as query param or Authorization: Bearer <key>.
+    Docs: https://www.searchapi.io/docs/google
+    """
+    api_key = _env("SEARCHAPI_KEY")
+    if not api_key:
+        return []
+
+    try:
+        url = "https://www.searchapi.io/api/v1/search"
+        params = {
+            "engine": "google",
+            "q": query,
+            "api_key": api_key,
+            "hl": "en",
+            "gl": "us",
+            "page": 1,
+        }
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json() or {}
+
+        organic = data.get("organic_results") or []
+        out: List[Dict[str, str]] = []
+        for item in organic[:k]:
+            out.append(
+                {
+                    "title": str(item.get("title", "")),
+                    "link": str(item.get("link", "")),
+                    "snippet": str(item.get("snippet", "")),
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
+def _strip_html_to_text(raw_html: str) -> str:
+    """Lightweight HTML->text without extra deps."""
+    raw_html = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", raw_html)
+    raw_html = re.sub(r"(?is)<[^>]+>", " ", raw_html)
+    raw_html = html_lib.unescape(raw_html)
+    raw_html = re.sub(r"\s+", " ", raw_html).strip()
+    return raw_html
+
+
+def fetch_page_text(url: str, timeout: int = 12) -> str:
+    now = time.time()
+    cached = _PAGE_CACHE.get(url)
+    if cached and (now - float(cached.get("ts", 0)) < _CACHE_TTL_SECONDS):
+        return str(cached.get("text", ""))
+
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "AquaBot/1.0"})
+        r.raise_for_status()
+        text = _strip_html_to_text(r.text)
+    except Exception:
+        text = ""
+
+    _PAGE_CACHE[url] = {"ts": now, "text": text}
+    return text
+
+
+def extract_links(html_text: str, base_url: str) -> List[str]:
+    links = re.findall(r'(?i)href\s*=\s*["\']([^"\']+)["\']', html_text)
+    out: List[str] = []
+    for href in links:
+        href = href.strip()
+        if not href or href.startswith("#"):
+            continue
+        if href.startswith(("mailto:", "tel:", "javascript:")):
+            continue
+        full = urljoin(base_url, href)
+        if full.startswith(BASE_SITE):
+            out.append(full)
+    return list(dict.fromkeys(out))
+
+
+def get_main_site_urls() -> List[str]:
+    return [
+        urljoin(BASE_SITE, "index.html"),
+        urljoin(BASE_SITE, "FAQ.html"),
+        urljoin(BASE_SITE, "Discoverfreediving.html"),
+        urljoin(BASE_SITE, "BasicFreediver.html"),
+        urljoin(BASE_SITE, "Freediver.html"),
+        urljoin(BASE_SITE, "Advancedfreediver.html"),
+        urljoin(BASE_SITE, "trainingsession.html"),
+        urljoin(BASE_SITE, "FunFreediving.html"),
+        urljoin(BASE_SITE, "freedivingequipment.html"),
+        urljoin(BASE_SITE, "divesites.html"),
+        urljoin(BASE_SITE, "cedar-pride.html"),
+        urljoin(BASE_SITE, "military.html"),
+        urljoin(BASE_SITE, "Tristar.html"),
+        urljoin(BASE_SITE, "C-130.html"),
+        urljoin(BASE_SITE, "Tank.html"),
+    ]
+
+
+def get_blog_urls(max_posts: int = 30) -> List[str]:
+    try:
+        r = requests.get(BLOG_INDEX_URL, timeout=12, headers={"User-Agent": "AquaBot/1.0"})
+        r.raise_for_status()
+        links = extract_links(r.text, BLOG_INDEX_URL)
+        blog_links = [u for u in links if re.search(r"/blog\d+\.html$", u, re.I)]
+        return blog_links[:max_posts]
+    except Exception:
+        return [urljoin(BASE_SITE, f"blog{i}.html") for i in range(1, 21)]
+
+
+def score_text_match(query: str, text: str) -> int:
+    q_terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 3]
+    if not q_terms:
+        return 0
+    t = text.lower()
+    score = 0
+    for term in set(q_terms):
+        if term in t:
+            score += 1
+    return score
+
+
+def retrieve_site_context(
+    question: str,
+    urls: List[str],
+    top_k: int = 4,
+    max_chars: int = 4000,
+) -> List[Dict[str, str]]:
+    scored: List[Tuple[int, str, str]] = []
+    for u in urls:
+        txt = fetch_page_text(u)
+        if not txt:
+            continue
+        s = score_text_match(question, txt)
+        if s <= 0:
+            continue
+        scored.append((s, u, txt))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    out: List[Dict[str, str]] = []
+    for s, u, txt in scored[:top_k]:
+        snippet = txt[: min(len(txt), 1200)]
+        out.append({"url": u, "snippet": snippet})
+
+    total = 0
+    trimmed: List[Dict[str, str]] = []
+    for item in out:
+        chunk = f"URL: {item['url']}\nTEXT: {item['snippet']}\n\n"
+        if total + len(chunk) > max_chars:
+            break
+        trimmed.append(item)
+        total += len(chunk)
+    return trimmed
+
+
+# -----------------------------
 # Admin Auth
 # -----------------------------
 def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -86,7 +260,6 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
     pass_ok = secrets.compare_digest(credentials.password or "", expected_pass or "")
 
     if not (user_ok and pass_ok):
-        # Make browsers prompt for creds
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
@@ -132,11 +305,8 @@ def send_owner_email(subject: str, body: str) -> None:
             timeout=15,
         )
 
-        # 202 is success for SendGrid
         if r.status_code != 202:
-            print(
-                f"SendGrid FAILED: status={r.status_code} body={r.text[:500]}"
-            )
+            print(f"SendGrid FAILED: status={r.status_code} body={r.text[:500]}")
     except Exception as e:
         print(f"SendGrid FAILED: {type(e).__name__}: {e}")
 
@@ -178,7 +348,7 @@ def fetch_calendar_events() -> List[str]:
 
 
 # -----------------------------
-# Gemini (supports either new or old SDK)
+# Gemini (site -> blog -> web; keeps booking/email logic unchanged)
 # -----------------------------
 def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
     api_key = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
@@ -187,18 +357,18 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
 
-    system = (
-        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\n"
-        "Rules:\n"
-        "1) Be brief, clear, helpful.\n"
-        "2) If the user asks about prices, link to: https://www.aboodfreediver.com/Prices.php?lang=en\n"
-        "3) If the user asks about contact/booking, link to: https://www.aboodfreediver.com/form1.php\n"
-        "4) If the user asks about availability/dates:\n"
-        "   - If calendar has events, mention the next dates.\n"
-        "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n"
-        "5) If user asks opening hours, answer with the standard hours the instructor uses (if unknown, ask them to contact).\n"
-        "6) If uncertain, ask 1 short follow-up question.\n"
-    )
+    # 1) Retrieve context: main site -> blog
+    main_ctx = retrieve_site_context(question, get_main_site_urls())
+    blog_ctx: List[Dict[str, str]] = []
+    if not main_ctx:
+        blog_ctx = retrieve_site_context(question, get_blog_urls())
+
+    have_grounding = bool(main_ctx or blog_ctx)
+
+    # 2) Web search only if site/blog didn't match
+    web_ctx: List[Dict[str, str]] = []
+    if not have_grounding:
+        web_ctx = searchapi_web_search(question, k=5)
 
     dates = fetch_calendar_events()
     cal_context = (
@@ -207,7 +377,48 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         else "Calendar shows no upcoming dates (may mean mostly free; must confirm with instructor)."
     )
 
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": system + "\n\n" + cal_context}]
+    grounding_text = ""
+    if main_ctx:
+        grounding_text += "MAIN SITE SOURCES:\n" + "\n\n".join(
+            [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in main_ctx]
+        )
+    if blog_ctx:
+        grounding_text += "\n\nBLOG SOURCES:\n" + "\n\n".join(
+            [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in blog_ctx]
+        )
+    if web_ctx:
+        grounding_text += "\n\nWEB RESULTS:\n" + "\n\n".join(
+            [f"TITLE: {w['title']}\nURL: {w['link']}\nSNIPPET: {w['snippet']}" for w in web_ctx]
+        )
+
+    system = (
+        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\n"
+        "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n\n"
+        "Hard business rules:\n"
+        "1) If asked about prices, link to: https://www.aboodfreediver.com/Prices.php?lang=en\n"
+        "2) If asked about contact/booking, link to: https://www.aboodfreediver.com/form1.php\n"
+        "3) If asked about availability/dates:\n"
+        "   - If calendar has events, mention the next dates.\n"
+        "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n\n"
+    )
+
+    if have_grounding or web_ctx:
+        system += (
+            "Content rules (IMPORTANT):\n"
+            "- Use ONLY the provided MAIN SITE / BLOG SOURCES and (if present) WEB RESULTS for factual claims.\n"
+            "- If the answer is not in those sources, say exactly: \"I couldn’t find this on the website/blog.\" "
+            "Then provide a short best-effort general answer.\n"
+            "- When you use info from sources, cite the URL(s) in the answer.\n"
+        )
+    else:
+        system += "Provide a concise, accurate general answer.\n"
+
+    msgs: List[Dict[str, str]] = [
+        {
+            "role": "system",
+            "content": system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else ""),
+        }
+    ]
 
     if history:
         for m in history[-12:]:
@@ -225,7 +436,11 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         client = genai.Client(api_key=api_key)
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
 
-        resp = client.models.generate_content(model=model, contents=prompt)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config={"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 700},
+        )
         text = getattr(resp, "text", None)
         if text and str(text).strip():
             return str(text).strip()
@@ -237,10 +452,16 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         import google.generativeai as genai_old  # type: ignore
 
         genai_old.configure(api_key=api_key)
-        gm = genai_old.GenerativeModel(model_name=model, system_instruction=system + "\n\n" + cal_context)
+        gm = genai_old.GenerativeModel(
+            model_name=model,
+            system_instruction=system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else ""),
+        )
 
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs if m["role"] != "system"])
-        r = gm.generate_content(prompt)
+        r = gm.generate_content(
+            prompt,
+            generation_config={"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 700},
+        )
         text = getattr(r, "text", None)
         if text and str(text).strip():
             return str(text).strip()
@@ -280,7 +501,19 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
         msg += f"Form: {FORM_URL}"
         return (msg, False)
 
-    if any(k in q for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]):
+    if any(
+        k in q
+        for k in [
+            "availability",
+            "available",
+            "calendar",
+            "date",
+            "dates",
+            "schedule",
+            "time slot",
+            "time are you free",
+        ]
+    ):
         dates = fetch_calendar_events()
         if dates:
             return (
@@ -294,7 +527,10 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
             True,
         )
 
-    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
+    if any(
+        k in q
+        for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]
+    ):
         hours = _env("OPENING_HOURS", default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}")
         return (hours, False)
 
@@ -341,7 +577,10 @@ def chat(req: ChatRequest):
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
     # RULE OVERRIDES (NO NOTIFY)
-    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
+    if any(
+        k in q
+        for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]
+    ):
         hours = _env("OPENING_HOURS", default="Open daily 9:00-17:00 (Aqaba time).")
         return ChatResponse(answer=hours, session_id=session_id, needs_human=False, source="rules")
 
@@ -374,8 +613,17 @@ def chat(req: ChatRequest):
         needs_human = any(
             k in q
             for k in [
-                "availability", "available", "calendar", "date", "dates", "schedule", "time slot",
-                "book", "booking", "reserve", "reservation",
+                "availability",
+                "available",
+                "calendar",
+                "date",
+                "dates",
+                "schedule",
+                "time slot",
+                "book",
+                "booking",
+                "reserve",
+                "reservation",
             ]
         )
         if needs_human:
