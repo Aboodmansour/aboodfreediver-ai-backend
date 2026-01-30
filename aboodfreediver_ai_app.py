@@ -5,6 +5,7 @@ import re
 import uuid
 import time
 import asyncio
+import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -34,6 +35,36 @@ app.add_middleware(
 )
 
 security = HTTPBasic()
+# -----------------------------
+# Background warming on startup (best performance)
+# -----------------------------
+async def _warm_cache_and_index() -> None:
+    try:
+        # warm service urls
+        svc_urls = get_service_urls(max_urls=60)
+        # warm key pages quickly in threads
+        async def warm_url(u: str) -> None:
+            await asyncio.to_thread(fetch_page_text, u, 12)
+
+        tasks = [warm_url(u) for u in svc_urls[:60]]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # warm some blog pages
+        blog_urls = get_blog_urls(max_posts=25)
+        tasks2 = [warm_url(u) for u in blog_urls[:25]]
+        await asyncio.gather(*tasks2, return_exceptions=True)
+
+        # build BM25 index using warmed service urls (best coverage)
+        await asyncio.to_thread(_build_bm25_index, svc_urls[:80], "services")
+        _log("Warm cache done. Indexed docs:", int(_DOC_INDEX.get("n") or 0))
+    except Exception as e:
+        _log("Warm cache failed:", type(e).__name__, str(e))
+
+@app.on_event("startup")
+async def _startup_event():
+    # fire-and-forget warming task; does not block requests
+    asyncio.create_task(_warm_cache_and_index())
+
 
 
 # -----------------------------
@@ -150,6 +181,75 @@ BLOG_INDEX_URL = _env("BLOG_SITEMAP_URL", default=urljoin(BASE_SITE, "blog.html"
 _PAGE_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": float, "text": str}
 _CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 
+# -----------------------------
+# Lightweight search index (BM25; no embeddings)
+# -----------------------------
+_DOC_INDEX: Dict[str, Any] = {
+    "ts": 0.0,
+    "docs": [],      # list[{"url": str, "text": str, "tf": dict[str,int], "len": int}]
+    "idf": {},       # dict[str,float]
+    "avgdl": 0.0,
+    "n": 0,
+    "source": "none",
+}
+
+def _tokenize(text: str) -> List[str]:
+    # keep letters+digits across languages; Arabic letters are kept by \w in unicode mode
+    tokens = re.findall(r"[\w]+", text.lower(), flags=re.UNICODE)
+    return [t for t in tokens if len(t) >= 2]
+
+def _build_bm25_index(urls: List[str], source: str) -> None:
+    docs = []
+    df: Dict[str, int] = {}
+    total_len = 0
+
+    for u in urls:
+        txt = fetch_page_text(u)
+        if not txt:
+            continue
+        tokens = _tokenize(txt)
+        if not tokens:
+            continue
+        tf: Dict[str, int] = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        for t in set(tf.keys()):
+            df[t] = df.get(t, 0) + 1
+        dl = len(tokens)
+        total_len += dl
+        docs.append({"url": u, "text": txt, "tf": tf, "len": dl})
+
+    n = len(docs)
+    if n == 0:
+        _DOC_INDEX.update({"ts": time.time(), "docs": [], "idf": {}, "avgdl": 0.0, "n": 0, "source": source})
+        return
+
+    avgdl = total_len / n
+    idf: Dict[str, float] = {}
+    for term, dfi in df.items():
+        # BM25 idf with +1 to avoid negatives
+        idf[term] = math.log(1 + (n - dfi + 0.5) / (dfi + 0.5))
+
+    _DOC_INDEX.update({"ts": time.time(), "docs": docs, "idf": idf, "avgdl": avgdl, "n": n, "source": source})
+
+def _bm25_score(query: str, doc: Dict[str, Any], k1: float = 1.5, b: float = 0.75) -> float:
+    q_terms = _tokenize(query)
+    if not q_terms:
+        return 0.0
+    tf = doc["tf"]
+    dl = float(doc["len"])
+    avgdl = float(_DOC_INDEX.get("avgdl") or 0.0) or 1.0
+    score = 0.0
+    for t in q_terms:
+        if t not in tf:
+            continue
+        f = float(tf[t])
+        idf = float(_DOC_INDEX["idf"].get(t, 0.0))
+        denom = f + k1 * (1 - b + b * (dl / avgdl))
+        score += idf * (f * (k1 + 1) / (denom if denom else 1.0))
+    return score
+
+
 
 def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
     """
@@ -259,7 +359,7 @@ def get_main_site_urls() -> List[str]:
 _SERVICE_URLS_CACHE: Dict[str, Any] = {"ts": 0.0, "urls": []}
 _SERVICE_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
-def get_service_urls(max_urls: int = 25) -> List[str]:
+def get_service_urls(max_urls: int = 60) -> List[str]:
     """Discover additional internal service pages so Aqua can answer without keyword rules."""
     now = time.time()
     if now - float(_SERVICE_URLS_CACHE.get("ts", 0)) < _SERVICE_CACHE_TTL_SECONDS and _SERVICE_URLS_CACHE.get("urls"):
@@ -330,39 +430,49 @@ def retrieve_site_context(
     urls: List[str],
     top_k: int = 4,
     max_chars: int = 4000,
-    time_budget: float = 3.0,  # seconds
+    time_budget: float = 2.5,
 ) -> List[Dict[str, str]]:
+    """Return top matching page snippets with a strict time budget (prevents request timeouts)."""
     start = time.time()
-    scored: List[Tuple[int, str, str]] = []
 
-    for u in urls:
-        if time.time() - start > time_budget:
-            break  # ⬅️ prevents timeout
+    # If we have a BM25 index, use it (fast). Otherwise fallback to lightweight scoring on fetched texts.
+    use_index = bool(_DOC_INDEX.get("docs")) and time.time() - float(_DOC_INDEX.get("ts", 0)) < 8 * 60 * 60
+    scored: List[Tuple[float, str, str]] = []
 
-        txt = fetch_page_text(u)
-        if not txt:
-            continue
-
-        s = score_text_match(question, txt)
-        if s <= 0:
-            continue
-
-        scored.append((s, u, txt))
+    if use_index:
+        for d in _DOC_INDEX["docs"]:
+            if time.time() - start > time_budget:
+                break
+            s = _bm25_score(question, d)
+            if s <= 0:
+                continue
+            scored.append((s, d["url"], d["text"]))
+    else:
+        for u in urls:
+            if time.time() - start > time_budget:
+                break
+            txt = fetch_page_text(u)
+            if not txt:
+                continue
+            s = float(score_text_match(question, txt))
+            if s <= 0:
+                continue
+            scored.append((s, u, txt))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     out: List[Dict[str, str]] = []
     total = 0
     for s, u, txt in scored[:top_k]:
-        snippet = txt[: min(len(txt), 1200)]
-        chunk_len = len(snippet)
-        if total + chunk_len > max_chars:
+        snippet = txt[: min(len(txt), 1400)]
+        chunk = f"URL: {u}\nTEXT: {snippet}\n\n"
+        if total + len(chunk) > max_chars:
             break
         out.append({"url": u, "snippet": snippet})
-        total += chunk_len
+        total += len(chunk)
 
+    _log("SITE_CTX pages:", len(out))
     return out
-
 
 # -----------------------------
 # Admin Auth
@@ -473,6 +583,8 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
 
+    lang = detect_lang(question)
+
     # 1) Retrieve context: main site -> blog
     main_ctx = retrieve_site_context(question, get_service_urls())
     blog_ctx: List[Dict[str, str]] = []
@@ -481,9 +593,24 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     have_grounding = bool(main_ctx or blog_ctx)
 
+    # Confidence is based on how strong the site/blog match is.
+    best_score = 0.0
+    try:
+        if _DOC_INDEX.get('docs'):
+            # approximate: max bm25 across docs for this query within a small budget
+            start = time.time()
+            for d in _DOC_INDEX['docs'][:120]:
+                if time.time() - start > 0.25:
+                    break
+                best_score = max(best_score, _bm25_score(question, d))
+    except Exception:
+        pass
+    # scale to 0..1 (heuristic)
+    confidence = max(0.0, min(1.0, best_score / 8.0))
+
     # 2) Web search only if site/blog didn't match
     web_ctx: List[Dict[str, str]] = []
-    if not have_grounding:
+    if (not have_grounding) and confidence < 0.35:
         web_ctx = searchapi_web_search(question, k=5)
 
     dates = fetch_calendar_events()
@@ -509,7 +636,8 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     system = (
         "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\nYou ONLY answer questions about freediving, freediving training/safety, and Abood Freediver services.\nIf the user asks about topics unrelated to freediving/Abood Freediver, say you can’t help with that and ask them to rephrase a freediving-related question.\n"
-        "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n\n"
+        "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n"
+        "Respond in the same language as the user (Arabic if they write Arabic, otherwise English).\n\n"
         "Hard business rules:\n"
         "1) If asked about prices, link to: https://www.aboodfreediver.com/Prices.php?lang=en\n"
         "2) If asked about contact/booking, link to: https://www.aboodfreediver.com/form1.php\n"
@@ -526,7 +654,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     msgs: List[Dict[str, str]] = [
         {
             "role": "system",
-            "content": system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else ""),
+            "content": system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else "") + f"\n\nCONFIDENCE_HINT: {confidence:.2f}",
         }
     ]
 
@@ -583,6 +711,13 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
 
 
+def detect_lang(text: str) -> str:
+    # very simple Arabic detection
+    if re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", text):
+        return "ar"
+    return "en"
+
+
 def is_freediving_related(question: str) -> bool:
     q = question.lower()
     # allow common business interactions
@@ -613,13 +748,14 @@ def is_freediving_related(question: str) -> bool:
 # -----------------------------
 def fallback_answer(question: str) -> Tuple[str, bool]:
     q = question.strip().lower()
+    lang = detect_lang(question)
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
     # Minimal safe fallback if Gemini is unavailable
     if any(k in q for k in ["book", "booking", "reserve", "reservation", "availability", "available", "date", "dates", "schedule"]):
-        return (f"Please share your preferred date/time and I will confirm availability. Booking form: {FORM_URL}", True)
+        return ((f"Please share your preferred date/time and I will confirm availability. Booking form: {FORM_URL}") if lang=="en" else (f"من فضلك أخبرني بالتاريخ/الوقت الذي تريده وسأؤكد التوفر. نموذج الحجز: {FORM_URL}"), True)
 
-    return ("I can help with freediving training, safety, equipment, courses, and Abood Freediver services in Aqaba. What would you like to know?", False)
+    return (("I can help with freediving training, safety, equipment, courses, and Abood Freediver services in Aqaba. What would you like to know?") if lang=="en" else "أستطيع مساعدتك في تدريب الغوص الحر، السلامة، المعدات، الدورات، وخدمات Abood Freediver في العقبة. ماذا تريد أن تعرف؟", False)
 
 # -----------------------------
 # Routes
@@ -655,7 +791,16 @@ def chat(req: ChatRequest):
 
     # RULE OVERRIDES removed: Aqua now searches sources instead of keyword answers.
 
-    # try gemini (site -> blog -> web)
+    
+    # Proactive clarifying questions (reduces long/uncertain answers)
+    qlow = q
+    clarify_terms = ["when", "next", "which course", "what course", "recommend", "best course", "schedule", "available", "availability", "dates", "date"]
+    if any(t in qlow for t in clarify_terms):
+        # if user asks "when next course" but doesn't specify dates
+        if ("when" in qlow or "next" in qlow) and not re.search(r"\b\d{1,2}[/-]\d{1,2}\b|\b\d{4}\b|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b", qlow):
+            # let Gemini answer briefly, but prefer a clarifying question in the response context
+            pass
+# try gemini (site -> blog -> web)
     answer = try_gemini_answer(question, req.history)
     if answer:
         needs_human = any(
