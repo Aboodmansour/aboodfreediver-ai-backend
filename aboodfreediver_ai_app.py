@@ -34,6 +34,13 @@ app.add_middleware(
 
 security = HTTPBasic()
 
+DEBUG = os.getenv("DEBUG", "").strip() in ("1", "true", "True", "yes", "YES")
+
+
+def _debug(*args: Any) -> None:
+    if DEBUG:
+        print("[DEBUG]", *args)
+
 
 # -----------------------------
 # In-memory storage (Render free tier resets on deploy/sleep)
@@ -78,26 +85,27 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
-DEBUG = _env("DEBUG", default="0").strip() in ("1", "true", "True", "YES", "yes")
-
-
-def _log(*args: Any) -> None:
-    if DEBUG:
-        print("[AQUA]", *args)
-
-
 # -----------------------------
-# Site/Blog Retrieval Helpers (site -> blog -> web)
+# Site/Blog Retrieval Helpers (sitemap -> site pages -> blog -> web)
 # -----------------------------
-BASE_SITE = _env("BASE_SITE_URL", "SITE_BASE_URL", default="https://www.aboodfreediver.com/")
+BASE_SITE = _env("SITE_BASE_URL", "BASE_SITE_URL", default="https://www.aboodfreediver.com/")
 if not BASE_SITE.endswith("/"):
     BASE_SITE += "/"
 
-# Your env uses BLOG_SITEMAP_URL and it points to blog.html (works as blog index)
+SITE_SITEMAP_URL = _env("SITE_SITEMAP_URL", default=urljoin(BASE_SITE, "sitemaps.XML"))
 BLOG_INDEX_URL = _env("BLOG_SITEMAP_URL", default=urljoin(BASE_SITE, "blog.html"))
 
 _PAGE_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": float, "text": str}
 _CACHE_TTL_SECONDS = 60 * 60  # 1 hour
+
+_SITEMAP_CACHE: Dict[str, Any] = {"ts": 0.0, "urls": []}
+_SITEMAP_TTL_SECONDS = 12 * 60 * 60  # 12 hours
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
@@ -107,7 +115,6 @@ def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
     """
     api_key = _env("SEARCHAPI_KEY")
     if not api_key:
-        _log("SEARCHAPI_KEY missing -> web search disabled")
         return []
 
     try:
@@ -134,15 +141,13 @@ def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
                     "snippet": str(item.get("snippet", "")),
                 }
             )
-        _log("WEB_SEARCH results:", len(out))
         return out
     except Exception as e:
-        _log("WEB_SEARCH failed:", type(e).__name__, str(e))
+        _debug("SearchApi failed:", type(e).__name__, str(e)[:200])
         return []
 
 
 def _strip_html_to_text(raw_html: str) -> str:
-    """Lightweight HTML->text without extra deps."""
     raw_html = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", raw_html)
     raw_html = re.sub(r"(?is)<[^>]+>", " ", raw_html)
     raw_html = html_lib.unescape(raw_html)
@@ -150,17 +155,20 @@ def _strip_html_to_text(raw_html: str) -> str:
     return raw_html
 
 
-def fetch_page_text(url: str, timeout: int = 12) -> str:
+def fetch_page_text(url: str, timeout: int = 15) -> str:
     now = time.time()
     cached = _PAGE_CACHE.get(url)
     if cached and (now - float(cached.get("ts", 0)) < _CACHE_TTL_SECONDS):
         return str(cached.get("text", ""))
 
+    text = ""
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "AquaBot/1.0"})
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": DEFAULT_UA})
         r.raise_for_status()
         text = _strip_html_to_text(r.text)
-    except Exception:
+        _debug("Fetched page:", url, "chars:", len(text))
+    except Exception as e:
+        _debug("Fetch failed:", url, type(e).__name__, str(e)[:200])
         text = ""
 
     _PAGE_CACHE[url] = {"ts": now, "text": text}
@@ -182,64 +190,81 @@ def extract_links(html_text: str, base_url: str) -> List[str]:
     return list(dict.fromkeys(out))
 
 
-def get_main_site_urls() -> List[str]:
-    return [
-        urljoin(BASE_SITE, "index.html"),
-        urljoin(BASE_SITE, "FAQ.html"),
-        urljoin(BASE_SITE, "Discoverfreediving.html"),
-        urljoin(BASE_SITE, "BasicFreediver.html"),
-        urljoin(BASE_SITE, "Freediver.html"),
-        urljoin(BASE_SITE, "Advancedfreediver.html"),
-        urljoin(BASE_SITE, "trainingsession.html"),
-        urljoin(BASE_SITE, "FunFreediving.html"),
-        urljoin(BASE_SITE, "freedivingequipment.html"),
-        urljoin(BASE_SITE, "divesites.html"),
-        urljoin(BASE_SITE, "cedar-pride.html"),
-        urljoin(BASE_SITE, "military.html"),
-        urljoin(BASE_SITE, "Tristar.html"),
-        urljoin(BASE_SITE, "C-130.html"),
-        urljoin(BASE_SITE, "Tank.html"),
-    ]
+def get_site_urls_from_sitemap(max_urls: int = 120) -> List[str]:
+    now = time.time()
+    if now - float(_SITEMAP_CACHE.get("ts", 0)) < _SITEMAP_TTL_SECONDS and isinstance(_SITEMAP_CACHE.get("urls"), list):
+        return list(_SITEMAP_CACHE["urls"])[:max_urls]
+
+    urls: List[str] = []
+    try:
+        r = requests.get(SITE_SITEMAP_URL, timeout=15, headers={"User-Agent": DEFAULT_UA})
+        r.raise_for_status()
+        xml = r.text or ""
+        locs = re.findall(r"(?is)<loc>\s*([^<\s]+)\s*</loc>", xml)
+        for u in locs:
+            u = u.strip()
+            if u.startswith(BASE_SITE):
+                urls.append(u)
+        urls = list(dict.fromkeys(urls))[:max_urls]
+        _debug("Sitemap URLs:", len(urls))
+    except Exception as e:
+        _debug("Sitemap fetch failed:", type(e).__name__, str(e)[:200])
+        urls = []
+
+    _SITEMAP_CACHE["ts"] = now
+    _SITEMAP_CACHE["urls"] = urls
+    return urls
 
 
 def get_blog_urls(max_posts: int = 30) -> List[str]:
     try:
-        r = requests.get(BLOG_INDEX_URL, timeout=12, headers={"User-Agent": "AquaBot/1.0"})
+        r = requests.get(BLOG_INDEX_URL, timeout=15, headers={"User-Agent": DEFAULT_UA})
         r.raise_for_status()
         links = extract_links(r.text, BLOG_INDEX_URL)
-        # your blog looks like blog1.html, blog2.html, ...
         blog_links = [u for u in links if re.search(r"/blog\d+\.html$", u, re.I)]
-        if blog_links:
-            return blog_links[:max_posts]
-        # fallback if blog index doesn't list them clearly
+        return blog_links[:max_posts]
+    except Exception as e:
+        _debug("Blog index fetch failed:", type(e).__name__, str(e)[:200])
         return [urljoin(BASE_SITE, f"blog{i}.html") for i in range(1, 21)]
-    except Exception:
-        return [urljoin(BASE_SITE, f"blog{i}.html") for i in range(1, 21)]
+
+
+def _normalize_tokens(s: str) -> List[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(t) >= 3]
 
 
 def score_text_match(query: str, text: str) -> int:
-    q_terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 3]
-    if not q_terms:
+    """
+    Improved scoring:
+    - Adds synonyms so "age required" can match "18 years" + "pre-requisites"
+    - Gives extra weight to key terms
+    """
+    if not text:
         return 0
+
+    tokens = _normalize_tokens(query)
+    # add helpful synonyms
+    if any(t in tokens for t in ["age", "years", "year"]):
+        tokens += ["years", "year", "minimum", "min", "old"]
+    if any(t in tokens for t in ["required", "require", "requirements", "prerequisite", "prerequisites"]):
+        tokens += ["prerequisite", "prerequisites", "requirements", "pre", "requisites", "requisite", "must"]
+
     t = text.lower()
     score = 0
-    for term in set(q_terms):
+    for term in set(tokens):
         if term in t:
             score += 1
+
+    # small boost if course name is in the page
+    if "freediver" in (query or "").lower() and "freediver" in t:
+        score += 2
+
     return score
 
 
-def retrieve_site_context(
-    question: str,
-    urls: List[str],
-    top_k: int = 4,
-    max_chars: int = 4000,
-) -> List[Dict[str, str]]:
+def retrieve_site_context(question: str, urls: List[str], top_k: int = 5, max_chars: int = 4500) -> List[Dict[str, str]]:
     scored: List[Tuple[int, str, str]] = []
     for u in urls:
         txt = fetch_page_text(u)
-        if not txt:
-            continue
         s = score_text_match(question, txt)
         if s <= 0:
             continue
@@ -249,8 +274,7 @@ def retrieve_site_context(
 
     out: List[Dict[str, str]] = []
     for s, u, txt in scored[:top_k]:
-        snippet = txt[: min(len(txt), 1200)]
-        out.append({"url": u, "snippet": snippet})
+        out.append({"url": u, "snippet": txt[: min(len(txt), 1400)]})
 
     # Trim combined size
     total = 0
@@ -261,8 +285,6 @@ def retrieve_site_context(
             break
         trimmed.append(item)
         total += len(chunk)
-
-    _log("SITE_CTX pages:", len(trimmed))
     return trimmed
 
 
@@ -277,11 +299,7 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
     pass_ok = secrets.compare_digest(credentials.password or "", expected_pass or "")
 
     if not (user_ok and pass_ok):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
 
@@ -289,19 +307,12 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
 # Email notify via SendGrid API (Render-safe: HTTPS)
 # -----------------------------
 def send_owner_email(subject: str, body: str) -> None:
-    """
-    Uses SendGrid Email API over HTTPS.
-    Required env:
-      SENDGRID_API_KEY
-      SENDGRID_FROM  (must be a verified Single Sender or authenticated domain sender)
-      OWNER_NOTIFY_EMAIL
-    """
     owner_to = _env("OWNER_NOTIFY_EMAIL")
     if not owner_to:
         return
 
     api_key = _env("SENDGRID_API_KEY")
-    sg_from = _env("SENDGRID_FROM", "SMTP_FROM")  # allow reusing SMTP_FROM as sender
+    sg_from = _env("SENDGRID_FROM", "SMTP_FROM")
     if not api_key or not sg_from:
         return
 
@@ -314,14 +325,10 @@ def send_owner_email(subject: str, body: str) -> None:
     try:
         r = requests.post(
             "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload,
             timeout=15,
         )
-
         if r.status_code != 202:
             print(f"SendGrid FAILED: status={r.status_code} body={r.text[:500]}")
     except Exception as e:
@@ -336,24 +343,20 @@ _calendar_cache: Dict[str, Any] = {"ts": 0.0, "events": []}
 
 
 def fetch_calendar_events() -> List[str]:
-    """
-    Tries to extract upcoming event date lines from your public calendar page.
-    Cached for 10 minutes.
-    """
     now = time.time()
-    if now - _calendar_cache["ts"] < 600 and isinstance(_calendar_cache.get("events"), list):
+    if now - float(_calendar_cache.get("ts", 0)) < 600 and isinstance(_calendar_cache.get("events"), list):
         return _calendar_cache["events"]
 
     try:
-        r = requests.get(CALENDAR_URL, timeout=10, headers={"User-Agent": "AquaBot/1.0"})
+        r = requests.get(CALENDAR_URL, timeout=12, headers={"User-Agent": DEFAULT_UA})
         r.raise_for_status()
-        page_html = r.text
+        html = r.text
 
         date_regex = re.compile(
             r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\b",
             re.IGNORECASE,
         )
-        dates = list(dict.fromkeys(date_regex.findall(page_html)))[:5]
+        dates = list(dict.fromkeys(date_regex.findall(html)))[:5]
 
         _calendar_cache["ts"] = now
         _calendar_cache["events"] = dates
@@ -365,28 +368,32 @@ def fetch_calendar_events() -> List[str]:
 
 
 # -----------------------------
-# Gemini (site -> blog -> web; keeps booking/email logic unchanged)
+# Gemini (sitemap -> blog -> web)
 # -----------------------------
 def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
     api_key = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
     if not api_key:
-        _log("GEMINI key missing -> gemini disabled")
         return None
 
     model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
 
-    # 1) Retrieve context: main site -> blog
-    main_ctx = retrieve_site_context(question, get_main_site_urls())
+    # 1) Site pages from sitemap (best coverage)
+    site_urls = get_site_urls_from_sitemap(max_urls=120)
+    main_ctx = retrieve_site_context(question, site_urls)
+
+    # 2) Blog if site didn't match
     blog_ctx: List[Dict[str, str]] = []
     if not main_ctx:
         blog_ctx = retrieve_site_context(question, get_blog_urls())
 
     have_grounding = bool(main_ctx or blog_ctx)
 
-    # 2) Web search only if site/blog didn't match
+    # 3) Web only if nothing matched on site/blog
     web_ctx: List[Dict[str, str]] = []
     if not have_grounding:
         web_ctx = searchapi_web_search(question, k=5)
+
+    _debug("Grounding:", "site", len(main_ctx), "blog", len(blog_ctx), "web", len(web_ctx))
 
     dates = fetch_calendar_events()
     cal_context = (
@@ -418,18 +425,21 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         "3) If asked about availability/dates:\n"
         "   - If calendar has events, mention the next dates.\n"
         "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n\n"
-        "Content rules (IMPORTANT):\n"
-        "- Use ONLY the provided MAIN SITE / BLOG SOURCES and (if present) WEB RESULTS for factual claims.\n"
-        "- If the answer is not in those sources, say exactly: \"I couldn’t find this on the website/blog.\" "
-        "Then provide a short best-effort general answer.\n"
-        "- When you use info from sources, cite the URL(s) in the answer.\n"
     )
 
+    if have_grounding or web_ctx:
+        system += (
+            "Content rules (IMPORTANT):\n"
+            "- Use ONLY the provided MAIN SITE / BLOG SOURCES and (if present) WEB RESULTS for factual claims.\n"
+            "- If the answer is not in those sources, say exactly: \"I couldn’t find this on the website/blog.\" "
+            "Then provide a short best-effort general answer.\n"
+            "- When you use info from sources, cite the URL(s) in the answer.\n"
+        )
+    else:
+        system += "Provide a concise, accurate general answer.\n"
+
     msgs: List[Dict[str, str]] = [
-        {
-            "role": "system",
-            "content": system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else ""),
-        }
+        {"role": "system", "content": system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else "")}
     ]
 
     if history:
@@ -457,7 +467,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         if text and str(text).strip():
             return str(text).strip()
     except Exception as e:
-        _log("google-genai failed:", type(e).__name__, str(e))
+        _debug("New Gemini SDK failed:", type(e).__name__, str(e)[:200])
 
     # --- Fallback old SDK: google-generativeai ---
     try:
@@ -478,7 +488,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         if text and str(text).strip():
             return str(text).strip()
     except Exception as e:
-        _log("google-generativeai failed:", type(e).__name__, str(e))
+        _debug("Old Gemini SDK failed:", type(e).__name__, str(e)[:200])
         return None
 
     return None
@@ -493,11 +503,11 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
     if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
         return ("Prices are here: https://www.aboodfreediver.com/Prices.php?lang=en", False)
 
-    FORM_URL = "https://www.aboodfreediver.com/form1.php"
+    form_url = "https://www.aboodfreediver.com/form1.php"
 
     if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
         return (
-            f"To book, please fill this form: {FORM_URL} "
+            f"To book, please fill this form: {form_url} "
             "(or tell me the date/time you want and I will confirm availability).",
             True,
         )
@@ -511,28 +521,17 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
         if whatsapp:
             msg += f"Phone/WhatsApp: {whatsapp}\n"
         msg += f"Email: {email}\n"
-        msg += f"Form: {FORM_URL}"
+        msg += f"Form: {form_url}"
         return (msg, False)
 
-    if any(
-        k in q
-        for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]
-    ):
+    if any(k in q for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]):
         dates = fetch_calendar_events()
         if dates:
-            return (
-                "Upcoming calendar dates: " + ", ".join(dates) + ". "
-                "Tell me the day/time you want and I’ll confirm with the instructor.",
-                True,
-            )
-        return (
-            "We’re usually free if nothing is scheduled on the calendar, but I must confirm with the instructor first. "
-            "Tell me the day/time you want.",
-            True,
-        )
+            return ("Upcoming calendar dates: " + ", ".join(dates) + ". Tell me the day/time you want and I’ll confirm.", True)
+        return ("We’re usually free if nothing is scheduled, but I must confirm first. Tell me the day/time you want.", True)
 
     if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env("OPENING_HOURS", default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}")
+        hours = _env("OPENING_HOURS", default=f"Opening hours: please use the contact form to confirm today: {form_url}")
         return (hours, False)
 
     if any(k in q for k in ["hello", "hi", "hey", "good morning", "good evening"]):
@@ -544,12 +543,6 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
 # -----------------------------
 # Routes
 # -----------------------------
-@app.get("/")
-def root():
-    # avoids Render showing lots of 404s for GET /
-    return {"ok": True, "service": "Aqua", "time": datetime.now(timezone.utc).isoformat()}
-
-
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
@@ -570,7 +563,7 @@ def chat(req: ChatRequest):
     convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
 
     q = question.lower().strip()
-    FORM_URL = "https://www.aboodfreediver.com/form1.php"
+    form_url = "https://www.aboodfreediver.com/form1.php"
 
     # RULE OVERRIDES (NO NOTIFY)
     if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
@@ -586,40 +579,34 @@ def chat(req: ChatRequest):
         if whatsapp:
             msg += f"Phone/WhatsApp: {whatsapp}\n"
         msg += f"Email: {email}\n"
-        msg += f"Form: {FORM_URL}"
+        msg += f"Form: {form_url}"
         return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
 
-    # IMPORTANT FIX:
-    # Previously, ANY "course" question was being answered by this canned list,
-    # which blocks Gemini from answering "age/requirements/prerequisites".
-    course_terms = ["courses", "course", "levels", "learn", "training", "certification"]
-    requirement_terms = [
-        "age", "old", "minimum", "min", "years",
-        "require", "required", "requirements", "prerequisite", "prerequisites",
-        "medical", "doctor", "fit", "fitness", "health",
-        "can i", "allowed", "eligibility",
-    ]
+    # Courses: ONLY show the generic list if the user is not asking about requirements
+    if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
+        requirement_terms = [
+            "age", "old", "minimum", "min", "years",
+            "require", "required", "requirements", "prerequisite", "prerequisites",
+            "medical", "doctor", "fit", "fitness", "health",
+        ]
+        if not any(t in q for t in requirement_terms):
+            msg = (
+                "We offer freediving courses for all levels:\n"
+                "- Discovery Freediver (beginner try)\n"
+                "- Freediver (Level 1)\n"
+                "- Advanced Freediver (Level 2)\n"
+                "- Master Freediver (Level 3)\n\n"
+                "Tell me your experience level and how many days you have, and I’ll recommend the best option."
+            )
+            return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
+        # else: fall through to Gemini so it can fetch prerequisites from the site
 
-    if any(t in q for t in course_terms) and not any(t in q for t in requirement_terms):
-        msg = (
-            "We offer freediving courses for all levels:\n"
-            "- Discovery Freediver (beginner try)\n"
-            "- Freediver (Level 1)\n"
-            "- Advanced Freediver (Level 2)\n"
-            "- Master Freediver (Level 3)\n\n"
-            "Tell me your experience level and how many days you have, and I’ll recommend the best option."
-        )
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-
-    # try gemini (site -> blog -> web)
+    # try gemini
     answer = try_gemini_answer(question, req.history)
     if answer:
         needs_human = any(
             k in q
-            for k in [
-                "availability", "available", "calendar", "date", "dates", "schedule", "time slot",
-                "book", "booking", "reserve", "reservation",
-            ]
+            for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "book", "booking", "reserve", "reservation"]
         )
         if needs_human:
             convo["needs_human"] = True
