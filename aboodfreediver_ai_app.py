@@ -343,6 +343,7 @@ def get_main_site_urls() -> List[str]:
         urljoin(BASE_SITE, "Advancedfreediver.html"),
         urljoin(BASE_SITE, "trainingsession.html"),
         urljoin(BASE_SITE, "FunFreediving.html"),
+        urljoin(BASE_SITE, "snorkelguide.html"),
         urljoin(BASE_SITE, "freedivingequipment.html"),
         urljoin(BASE_SITE, "divesites.html"),
         urljoin(BASE_SITE, "cedar-pride.html"),
@@ -351,6 +352,16 @@ def get_main_site_urls() -> List[str]:
         urljoin(BASE_SITE, "C-130.html"),
         urljoin(BASE_SITE, "Tank.html"),
     ]
+
+COURSE_URLS: List[str] = [
+    "https://www.aboodfreediver.com/Discoverfreediving.html",
+    "https://www.aboodfreediver.com/BasicFreediver.html",
+    "https://www.aboodfreediver.com/Freediver.html",
+    "https://www.aboodfreediver.com/trainingsession.html",
+    "https://www.aboodfreediver.com/FunFreediving.html",
+    "https://www.aboodfreediver.com/Advancedfreediver.html",
+    "https://www.aboodfreediver.com/snorkelguide.html",
+]
 
 
 # -----------------------------
@@ -372,6 +383,9 @@ def get_service_urls(max_urls: int = 60) -> List[str]:
         urljoin(BASE_SITE, "BasicFreediver.html"),
         urljoin(BASE_SITE, "Freediver.html"),
         urljoin(BASE_SITE, "Advancedfreediver.html"),
+        urljoin(BASE_SITE, "trainingsession.html"),
+        urljoin(BASE_SITE, "FunFreediving.html"),
+        urljoin(BASE_SITE, "snorkelguide.html"),
     ]
 
     urls: List[str] = []
@@ -586,12 +600,16 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     lang = detect_lang(question)
 
     # 1) Retrieve context: main site -> blog
+    # Course pages are always checked first for course-related questions
+    course_ctx: List[Dict[str, str]] = []
+    if any(k in question.lower() for k in ["course", "courses", "level", "levels", "discover", "basic", "freediver", "advanced", "training", "session", "snorkel"]):
+        course_ctx = retrieve_site_context(question, COURSE_URLS, top_k=4, max_chars=3000, time_budget=1.2)
     main_ctx = retrieve_site_context(question, get_service_urls())
     blog_ctx: List[Dict[str, str]] = []
     if not main_ctx:
         blog_ctx = retrieve_site_context(question, get_blog_urls())
 
-    have_grounding = bool(main_ctx or blog_ctx)
+    have_grounding = bool(course_ctx or main_ctx or blog_ctx)
 
     # Confidence is based on how strong the site/blog match is.
     best_score = 0.0
@@ -610,7 +628,8 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     # 2) Web search only if site/blog didn't match
     web_ctx: List[Dict[str, str]] = []
-    if (not have_grounding) and confidence < 0.35:
+    external_agency = any(k in question.lower() for k in ["padi", "aida", "molchanovs", "ssi"]) 
+    if ((not have_grounding) and confidence < 0.35) or external_agency:
         web_ctx = searchapi_web_search(question, k=5)
 
     dates = fetch_calendar_events()
@@ -621,6 +640,10 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     )
 
     grounding_text = ""
+    if course_ctx:
+        grounding_text += "COURSE SOURCES:\n" + "\n\n".join(
+            [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in course_ctx]
+        )
     if main_ctx:
         grounding_text += "MAIN SITE SOURCES:\n" + "\n\n".join(
             [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in main_ctx]
@@ -638,10 +661,10 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\nYou ONLY answer questions about freediving, freediving training/safety, and Abood Freediver services.\nIf the user asks about topics unrelated to freediving/Abood Freediver, say you can’t help with that and ask them to rephrase a freediving-related question.\n"
         "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n"
         "Respond in the same language as the user (Arabic if they write Arabic, otherwise English).\n\n"
-        "Hard business rules:\n"
-        "1) If asked about prices, link to: https://www.aboodfreediver.com/Prices.php?lang=en\n"
+        "Hard business rules (the ONLY thing that requires human confirmation is booking/availability):\n"
+        "1) If asked about prices: answer with the exact prices if they appear in MAIN SITE / SERVICES sources; also include this link for reference: https://www.aboodfreediver.com/Prices.php?lang=en\n"
         "2) If asked about contact/booking, link to: https://www.aboodfreediver.com/form1.php\n"
-        "3) If asked about availability/dates:\n"
+        "3) If asked about availability/dates (requires instructor confirmation):\n"
         "   - If calendar has events, mention the next dates.\n"
         "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n\n"
         "Content rules (IMPORTANT):\n"
@@ -667,7 +690,33 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     msgs.append({"role": "user", "content": question})
 
-    # --- Try new SDK first: google-genai ---
+    
+def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Optional[str]:
+    """Direct REST call to Gemini API (avoids SDK issues)."""
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        r = requests.post(
+            url,
+            params={"key": api_key},
+            json={
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.2, "topP": 0.9, "maxOutputTokens": 700},
+            },
+            timeout=25,
+        )
+        r.raise_for_status()
+        data = r.json() or {}
+        cands = data.get("candidates") or []
+        if not cands:
+            return None
+        parts = (((cands[0] or {}).get("content") or {}).get("parts") or [])
+        text = " ".join([str(p.get("text", "")).strip() for p in parts if isinstance(p, dict)]).strip()
+        return text or None
+    except Exception as e:
+        _log("gemini REST failed:", type(e).__name__, str(e))
+        return None
+
+# --- Try new SDK first: google-genai ---
     try:
         from google import genai  # type: ignore
 
@@ -760,6 +809,11 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
 # -----------------------------
 # Routes
 # -----------------------------
+@app.head("/")
+def root_head():
+    return {"ok": True}
+
+
 @app.get("/")
 def root():
     # avoids Render showing lots of 404s for GET /
