@@ -5,6 +5,7 @@ import re
 import uuid
 import time
 import asyncio
+import hashlib
 import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
@@ -180,6 +181,30 @@ BLOG_INDEX_URL = _env("BLOG_SITEMAP_URL", default=urljoin(BASE_SITE, "blog.html"
 
 _PAGE_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": float, "text": str}
 _CACHE_TTL_SECONDS = 60 * 60  # 1 hour
+
+
+# -----------------------------
+# Gemini response cache (reduces quota usage)
+# -----------------------------
+_GEMINI_RESPONSE_CACHE: Dict[str, Dict[str, Any]] = {}  # key -> {"ts": float, "text": str}
+_GEMINI_RESPONSE_CACHE_TTL = 6 * 60 * 60  # 6 hours
+
+def _cache_key(question: str, lang: str, session_id: str = "") -> str:
+    # do not include session_id so answers are reusable
+    base = f"{lang}|{question.strip().lower()}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+def _cache_get(key: str) -> Optional[str]:
+    item = _GEMINI_RESPONSE_CACHE.get(key)
+    if not item:
+        return None
+    if time.time() - float(item.get("ts", 0)) > _GEMINI_RESPONSE_CACHE_TTL:
+        _GEMINI_RESPONSE_CACHE.pop(key, None)
+        return None
+    return str(item.get("text") or "") or None
+
+def _cache_set(key: str, text: str) -> None:
+    _GEMINI_RESPONSE_CACHE[key] = {"ts": time.time(), "text": text}
 
 # -----------------------------
 # Lightweight search index (BM25; no embeddings)
@@ -598,6 +623,10 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
 
     lang = detect_lang(question)
+    ck = _cache_key(question, lang)
+    cached = _cache_get(ck)
+    if cached:
+        return cached
 
     # 1) Retrieve context: main site -> blog
     # Course pages are always checked first for course-related questions
@@ -728,7 +757,9 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
         for mm in models_to_try:
             text, err = gemini_rest_generate(api_key=api_key, model=mm, prompt=prompt)
             if text and str(text).strip():
-                return str(text).strip()
+                ans = str(text).strip()
+                _cache_set(ck, ans)
+                return ans
             last_err = err or last_err
 
         if last_err:
@@ -750,7 +781,9 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
         )
         text = getattr(resp, "text", None)
         if text and str(text).strip():
-            return str(text).strip()
+            ans = str(text).strip()
+                _cache_set(ck, ans)
+                return ans
     except Exception as e:
         _log("google-genai failed:", type(e).__name__, str(e))
 
@@ -771,7 +804,9 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
         )
         text = getattr(r, "text", None)
         if text and str(text).strip():
-            return str(text).strip()
+            ans = str(text).strip()
+                _cache_set(ck, ans)
+                return ans
     except Exception as e:
         _log("google-generativeai failed:", type(e).__name__, str(e))
         return None
@@ -810,6 +845,28 @@ def is_freediving_related(question: str) -> bool:
         "equipment", "weight", "weights", "ear", "sinus", "pressure",
     ]
     return any(k in q for k in keywords)
+
+
+
+def build_extractive_answer(question: str, lang: str, contexts: List[Dict[str, str]]) -> str:
+    """Answer using extracted snippets from site/blog when LLM is unavailable."""
+    if not contexts:
+        if lang == "ar":
+            return "حالياً لا أستطيع الوصول إلى نموذج الذكاء الاصطناعي بسبب حد الاستخدام. اسألني سؤالاً محدداً عن الدورات أو الأسعار أو السلامة، وسأحاول الإجابة من صفحات الموقع."
+        return "The AI model is temporarily rate-limited/quota-limited. Ask a specific question about courses/prices/safety and I will answer from the website pages."
+
+    # pick the best 1-2 snippets
+    parts = []
+    for c in contexts[:2]:
+        snippet = (c.get("snippet") or "").strip()
+        url = (c.get("url") or "").strip()
+        if snippet:
+            # keep it readable
+            snippet = re.sub(r"\s+", " ", snippet)
+            parts.append(f"- {snippet}\n  Source: {url}")
+    if lang == "ar":
+        return "من صفحات الموقع:\n" + "\n".join(parts)
+    return "From the website pages:\n" + "\n".join(parts)
 
 
 # -----------------------------
