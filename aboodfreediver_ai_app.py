@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.2.1")
+app = FastAPI(title="Aqua – Abood Freediver Assistant", version="1.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,8 +78,12 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
-def _debug_enabled() -> bool:
-    return _env("DEBUG_LOG", default="").strip().lower() in ("1", "true", "yes", "on")
+DEBUG = _env("DEBUG", default="0").strip() in ("1", "true", "True", "YES", "yes")
+
+
+def _log(*args: Any) -> None:
+    if DEBUG:
+        print("[AQUA]", *args)
 
 
 # -----------------------------
@@ -99,11 +103,11 @@ _CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
     """
     Uses SearchApi.io Google Search API.
-    Env:
-      SEARCHAPI_KEY
+    Env: SEARCHAPI_KEY
     """
     api_key = _env("SEARCHAPI_KEY")
     if not api_key:
+        _log("SEARCHAPI_KEY missing -> web search disabled")
         return []
 
     try:
@@ -130,8 +134,10 @@ def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
                     "snippet": str(item.get("snippet", "")),
                 }
             )
+        _log("WEB_SEARCH results:", len(out))
         return out
-    except Exception:
+    except Exception as e:
+        _log("WEB_SEARCH failed:", type(e).__name__, str(e))
         return []
 
 
@@ -201,8 +207,12 @@ def get_blog_urls(max_posts: int = 30) -> List[str]:
         r = requests.get(BLOG_INDEX_URL, timeout=12, headers={"User-Agent": "AquaBot/1.0"})
         r.raise_for_status()
         links = extract_links(r.text, BLOG_INDEX_URL)
+        # your blog looks like blog1.html, blog2.html, ...
         blog_links = [u for u in links if re.search(r"/blog\d+\.html$", u, re.I)]
-        return blog_links[:max_posts]
+        if blog_links:
+            return blog_links[:max_posts]
+        # fallback if blog index doesn't list them clearly
+        return [urljoin(BASE_SITE, f"blog{i}.html") for i in range(1, 21)]
     except Exception:
         return [urljoin(BASE_SITE, f"blog{i}.html") for i in range(1, 21)]
 
@@ -242,6 +252,7 @@ def retrieve_site_context(
         snippet = txt[: min(len(txt), 1200)]
         out.append({"url": u, "snippet": snippet})
 
+    # Trim combined size
     total = 0
     trimmed: List[Dict[str, str]] = []
     for item in out:
@@ -250,6 +261,8 @@ def retrieve_site_context(
             break
         trimmed.append(item)
         total += len(chunk)
+
+    _log("SITE_CTX pages:", len(trimmed))
     return trimmed
 
 
@@ -318,7 +331,7 @@ def send_owner_email(subject: str, body: str) -> None:
 # -----------------------------
 # Calendar check (basic scrape + cache)
 # -----------------------------
-CALENDAR_URL = _env("CALENDAR_URL", default="https://www.aboodfreediver.com/calendar.php")
+CALENDAR_URL = _env("CALENDAR_URL", default=urljoin(BASE_SITE, "calendar.php"))
 _calendar_cache: Dict[str, Any] = {"ts": 0.0, "events": []}
 
 
@@ -332,15 +345,15 @@ def fetch_calendar_events() -> List[str]:
         return _calendar_cache["events"]
 
     try:
-        r = requests.get(CALENDAR_URL, timeout=10)
+        r = requests.get(CALENDAR_URL, timeout=10, headers={"User-Agent": "AquaBot/1.0"})
         r.raise_for_status()
-        html = r.text
+        page_html = r.text
 
         date_regex = re.compile(
             r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\b",
             re.IGNORECASE,
         )
-        dates = list(dict.fromkeys(date_regex.findall(html)))[:5]
+        dates = list(dict.fromkeys(date_regex.findall(page_html)))[:5]
 
         _calendar_cache["ts"] = now
         _calendar_cache["events"] = dates
@@ -357,6 +370,7 @@ def fetch_calendar_events() -> List[str]:
 def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
     api_key = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
     if not api_key:
+        _log("GEMINI key missing -> gemini disabled")
         return None
 
     model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
@@ -373,9 +387,6 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     web_ctx: List[Dict[str, str]] = []
     if not have_grounding:
         web_ctx = searchapi_web_search(question, k=5)
-
-    if _debug_enabled():
-        print("WEB_SEARCH_USED", len(web_ctx))
 
     dates = fetch_calendar_events()
     cal_context = (
@@ -407,18 +418,12 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         "3) If asked about availability/dates:\n"
         "   - If calendar has events, mention the next dates.\n"
         "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n\n"
+        "Content rules (IMPORTANT):\n"
+        "- Use ONLY the provided MAIN SITE / BLOG SOURCES and (if present) WEB RESULTS for factual claims.\n"
+        "- If the answer is not in those sources, say exactly: \"I couldn’t find this on the website/blog.\" "
+        "Then provide a short best-effort general answer.\n"
+        "- When you use info from sources, cite the URL(s) in the answer.\n"
     )
-
-    if have_grounding or web_ctx:
-        system += (
-            "Content rules (IMPORTANT):\n"
-            "- Use ONLY the provided MAIN SITE / BLOG SOURCES and (if present) WEB RESULTS for factual claims.\n"
-            "- If the answer is not in those sources, say exactly: \"I couldn’t find this on the website/blog.\" "
-            "Then provide a short best-effort general answer.\n"
-            "- When you use info from sources, cite the URL(s) in the answer.\n"
-        )
-    else:
-        system += "Provide a concise, accurate general answer.\n"
 
     msgs: List[Dict[str, str]] = [
         {
@@ -451,8 +456,8 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         text = getattr(resp, "text", None)
         if text and str(text).strip():
             return str(text).strip()
-    except Exception:
-        pass
+    except Exception as e:
+        _log("google-genai failed:", type(e).__name__, str(e))
 
     # --- Fallback old SDK: google-generativeai ---
     try:
@@ -472,7 +477,8 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         text = getattr(r, "text", None)
         if text and str(text).strip():
             return str(text).strip()
-    except Exception:
+    except Exception as e:
+        _log("google-generativeai failed:", type(e).__name__, str(e))
         return None
 
     return None
@@ -510,16 +516,7 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
 
     if any(
         k in q
-        for k in [
-            "availability",
-            "available",
-            "calendar",
-            "date",
-            "dates",
-            "schedule",
-            "time slot",
-            "time are you free",
-        ]
+        for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]
     ):
         dates = fetch_calendar_events()
         if dates:
@@ -534,23 +531,9 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
             True,
         )
 
-    if any(
-        k in q
-        for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]
-    ):
+    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
         hours = _env("OPENING_HOURS", default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}")
         return (hours, False)
-
-    if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
-        return (
-            "We offer freediving courses for all levels:\n"
-            "- Discovery Freediver (beginner try)\n"
-            "- Freediver (Level 1)\n"
-            "- Advanced Freediver (Level 2)\n"
-            "- Master Freediver (Level 3)\n\n"
-            "Tell me your experience level and how many days you have, and I’ll recommend the best option.",
-            False,
-        )
 
     if any(k in q for k in ["hello", "hi", "hey", "good morning", "good evening"]):
         return ("Hi, I’m Aqua. Ask me about courses, prices, safety, or availability in Aqaba.", False)
@@ -561,6 +544,12 @@ def fallback_answer(question: str) -> Tuple[str, bool]:
 # -----------------------------
 # Routes
 # -----------------------------
+@app.get("/")
+def root():
+    # avoids Render showing lots of 404s for GET /
+    return {"ok": True, "service": "Aqua", "time": datetime.now(timezone.utc).isoformat()}
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
@@ -584,10 +573,7 @@ def chat(req: ChatRequest):
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
     # RULE OVERRIDES (NO NOTIFY)
-    if any(
-        k in q
-        for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]
-    ):
+    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
         hours = _env("OPENING_HOURS", default="Open daily 9:00-17:00 (Aqaba time).")
         return ChatResponse(answer=hours, session_id=session_id, needs_human=False, source="rules")
 
@@ -603,42 +589,36 @@ def chat(req: ChatRequest):
         msg += f"Form: {FORM_URL}"
         return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
 
-    # Courses rule: only short “list of courses” answer.
-    # Requirements questions (age/medical/prereqs) should go to Gemini (site/blog/web).
-    if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
-        requirement_terms = [
-            "age", "old", "minimum", "min", "years",
-            "require", "required", "requirements", "prerequisite", "prerequisites",
-            "medical", "doctor", "fit", "fitness", "health",
-        ]
-        if not any(t in q for t in requirement_terms):
-            msg = (
-                "We offer freediving courses for all levels:\n"
-                "- Discovery Freediver (beginner try)\n"
-                "- Freediver (Level 1)\n"
-                "- Advanced Freediver (Level 2)\n"
-                "- Master Freediver (Level 3)\n\n"
-                "Tell me your experience level and how many days you have, and I’ll recommend the best option."
-            )
-            return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
+    # IMPORTANT FIX:
+    # Previously, ANY "course" question was being answered by this canned list,
+    # which blocks Gemini from answering "age/requirements/prerequisites".
+    course_terms = ["courses", "course", "levels", "learn", "training", "certification"]
+    requirement_terms = [
+        "age", "old", "minimum", "min", "years",
+        "require", "required", "requirements", "prerequisite", "prerequisites",
+        "medical", "doctor", "fit", "fitness", "health",
+        "can i", "allowed", "eligibility",
+    ]
 
-    # try gemini
+    if any(t in q for t in course_terms) and not any(t in q for t in requirement_terms):
+        msg = (
+            "We offer freediving courses for all levels:\n"
+            "- Discovery Freediver (beginner try)\n"
+            "- Freediver (Level 1)\n"
+            "- Advanced Freediver (Level 2)\n"
+            "- Master Freediver (Level 3)\n\n"
+            "Tell me your experience level and how many days you have, and I’ll recommend the best option."
+        )
+        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
+
+    # try gemini (site -> blog -> web)
     answer = try_gemini_answer(question, req.history)
     if answer:
         needs_human = any(
             k in q
             for k in [
-                "availability",
-                "available",
-                "calendar",
-                "date",
-                "dates",
-                "schedule",
-                "time slot",
-                "book",
-                "booking",
-                "reserve",
-                "reservation",
+                "availability", "available", "calendar", "date", "dates", "schedule", "time slot",
+                "book", "booking", "reserve", "reservation",
             ]
         )
         if needs_human:
