@@ -758,8 +758,8 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
             text, err = gemini_rest_generate(api_key=api_key, model=mm, prompt=prompt)
             if text and str(text).strip():
                 ans = str(text).strip()
-                _cache_set(ck, ans)
-                return ans
+            _cache_set(ck, ans)
+            return ans
             last_err = err or last_err
 
         if last_err:
@@ -782,8 +782,8 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
         text = getattr(resp, "text", None)
         if text and str(text).strip():
             ans = str(text).strip()
-                _cache_set(ck, ans)
-                return ans
+            _cache_set(ck, ans)
+            return ans
     except Exception as e:
         _log("google-genai failed:", type(e).__name__, str(e))
 
@@ -805,8 +805,8 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
         text = getattr(r, "text", None)
         if text and str(text).strip():
             ans = str(text).strip()
-                _cache_set(ck, ans)
-                return ans
+            _cache_set(ck, ans)
+            return ans
     except Exception as e:
         _log("google-generativeai failed:", type(e).__name__, str(e))
         return None
@@ -848,9 +848,13 @@ def is_freediving_related(question: str) -> bool:
 
 
 
-def build_extractive_answer(question: str, lang: str, contexts: List[Dict[str, str]]) -> str:
+def build_extractive_answer(question: str, lang: str, contexts: List[Dict[str, str]], web_ctx: Optional[str] = None) -> str:
     """Answer using extracted snippets from site/blog when LLM is unavailable."""
     if not contexts:
+        if web_ctx and web_ctx.strip():
+            if lang == "ar":
+                return "من نتائج البحث:\n" + web_ctx.strip()
+            return "From web search results:\n" + web_ctx.strip()
         if lang == "ar":
             return "حالياً لا أستطيع الوصول إلى نموذج الذكاء الاصطناعي بسبب حد الاستخدام. اسألني سؤالاً محدداً عن الدورات أو الأسعار أو السلامة، وسأحاول الإجابة من صفحات الموقع."
         return "The AI model is temporarily rate-limited/quota-limited. Ask a specific question about courses/prices/safety and I will answer from the website pages."
