@@ -6,16 +6,18 @@ import uuid
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
-from urllib.parse import urljoin
-import html as html_lib
+
 import secrets
 import requests
+from urllib.parse import urljoin
+import html as html_lib
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
+
 
 # -----------------------------
 # App
@@ -36,11 +38,6 @@ security = HTTPBasic()
 # In-memory storage (Render free tier resets on deploy/sleep)
 # -----------------------------
 CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
-# session_id -> {
-#   "messages": [{role, text, ts}],
-#   "needs_human": bool,
-#   "created": iso,
-# }
 
 # -----------------------------
 # Models
@@ -48,14 +45,14 @@ CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
     session_id: Optional[str] = None
-    history: Optional[List[Dict[str, str]]] = None  # optional, if your frontend sends it
+    history: Optional[List[Dict[str, str]]] = None
 
 
 class ChatResponse(BaseModel):
     answer: str
     session_id: str
     needs_human: bool = False
-    source: str = "fallback"  # "gemini" or "fallback"
+    source: str = "site"  # "site" | "web" | "gemini" | "fallback" | "rules"
 
 
 class HumanReply(BaseModel):
@@ -74,13 +71,6 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
 def _strip_html_to_text(raw_html: str) -> str:
     raw_html = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", raw_html)
     raw_html = re.sub(r"(?is)<[^>]+>", " ", raw_html)
@@ -89,33 +79,21 @@ def _strip_html_to_text(raw_html: str) -> str:
     return raw_html
 
 
-def _tokenize(s: str) -> List[str]:
-    return [t for t in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(t) >= 3]
-
-
 # -----------------------------
-# Site/Blog/Web settings
+# Site config
 # -----------------------------
 BASE_SITE = _env("BASE_SITE_URL", "SITE_BASE_URL", default="https://www.aboodfreediver.com/")
 if not BASE_SITE.endswith("/"):
     BASE_SITE += "/"
 
-# Blog index (your env points to blog.html)
+SITE_SITEMAP_URL = _env("SITE_SITEMAP_URL", default=urljoin(BASE_SITE, "sitemaps.XML"))
 BLOG_INDEX_URL = _env("BLOG_SITEMAP_URL", default=urljoin(BASE_SITE, "blog.html"))
 
-# Optional sitemap.xml (recommended; you already have SITE_SITEMAP_URL)
-SITEMAP_URL = _env("SITE_SITEMAP_URL", default=urljoin(BASE_SITE, "sitemaps.XML"))
+_PAGE_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 
-USER_AGENT = _env("AQUA_USER_AGENT", default="AquaBot/1.3 (+https://www.aboodfreediver.com)")
-SHOW_SOURCES = _env_bool("SHOW_SOURCES", default=False)  # set true only for debugging
-
-# Page cache
-_PAGE_CACHE: Dict[str, Dict[str, Any]] = {}  # url -> {"ts": float, "text": str}
-_CACHE_TTL_SECONDS = 60 * 30  # 30 minutes
-
-# Sitemap cache
 _SITEMAP_CACHE: Dict[str, Any] = {"ts": 0.0, "urls": []}
-_SITEMAP_TTL_SECONDS = 60 * 60 * 6  # 6 hours
+_SITEMAP_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
 
 def fetch_page_text(url: str, timeout: int = 12) -> str:
@@ -125,7 +103,7 @@ def fetch_page_text(url: str, timeout: int = 12) -> str:
         return str(cached.get("text", ""))
 
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "AquaBot/1.0"})
         r.raise_for_status()
         text = _strip_html_to_text(r.text)
     except Exception:
@@ -133,6 +111,36 @@ def fetch_page_text(url: str, timeout: int = 12) -> str:
 
     _PAGE_CACHE[url] = {"ts": now, "text": text}
     return text
+
+
+def fetch_sitemap_urls(limit: int = 250) -> List[str]:
+    """
+    Uses your SITE_SITEMAP_URL to discover pages.
+    Caches results to avoid hammering your site.
+    """
+    now = time.time()
+    if now - float(_SITEMAP_CACHE.get("ts", 0)) < _SITEMAP_TTL_SECONDS and isinstance(_SITEMAP_CACHE.get("urls"), list):
+        return list(_SITEMAP_CACHE["urls"])
+
+    urls: List[str] = []
+    try:
+        r = requests.get(SITE_SITEMAP_URL, timeout=15, headers={"User-Agent": "AquaBot/1.0"})
+        r.raise_for_status()
+        xml = r.text
+        # typical sitemap: <loc>https://...</loc>
+        locs = re.findall(r"(?is)<loc>\s*([^<\s]+)\s*</loc>", xml)
+        for u in locs:
+            u = u.strip()
+            if u.startswith(BASE_SITE):
+                urls.append(u)
+    except Exception:
+        urls = []
+
+    # de-dup, cap
+    urls = list(dict.fromkeys(urls))[:limit]
+    _SITEMAP_CACHE["ts"] = now
+    _SITEMAP_CACHE["urls"] = urls
+    return urls
 
 
 def extract_links(html_text: str, base_url: str) -> List[str]:
@@ -152,184 +160,133 @@ def extract_links(html_text: str, base_url: str) -> List[str]:
 
 def get_blog_urls(max_posts: int = 50) -> List[str]:
     try:
-        r = requests.get(BLOG_INDEX_URL, timeout=12, headers={"User-Agent": USER_AGENT})
+        r = requests.get(BLOG_INDEX_URL, timeout=12, headers={"User-Agent": "AquaBot/1.0"})
         r.raise_for_status()
         links = extract_links(r.text, BLOG_INDEX_URL)
         blog_links = [u for u in links if re.search(r"/blog\d+\.html$", u, re.I)]
         return blog_links[:max_posts]
     except Exception:
-        # fallback guesses
-        return [urljoin(BASE_SITE, f"blog{i}.html") for i in range(1, 21)]
-
-
-def get_main_site_urls() -> List[str]:
-    # Keep this list, but we will ALSO use the sitemap so we don't miss pages.
-    return [
-        urljoin(BASE_SITE, "index.html"),
-        urljoin(BASE_SITE, "FAQ.html"),
-        urljoin(BASE_SITE, "Discoverfreediving.html"),
-        urljoin(BASE_SITE, "BasicFreediver.html"),
-        urljoin(BASE_SITE, "Freediver.html"),
-        urljoin(BASE_SITE, "Advancedfreediver.html"),
-        urljoin(BASE_SITE, "trainingsession.html"),
-        urljoin(BASE_SITE, "FunFreediving.html"),
-        urljoin(BASE_SITE, "freedivingequipment.html"),
-        urljoin(BASE_SITE, "divesites.html"),
-        urljoin(BASE_SITE, "cedar-pride.html"),
-        urljoin(BASE_SITE, "military.html"),
-        urljoin(BASE_SITE, "Tristar.html"),
-        urljoin(BASE_SITE, "C-130.html"),
-        urljoin(BASE_SITE, "Tank.html"),
-    ]
-
-
-def _parse_sitemap_urls(xml_text: str) -> List[str]:
-    # Simple sitemap parser without extra deps
-    # Works for standard <urlset><url><loc>...</loc>...
-    locs = re.findall(r"(?is)<loc>\s*([^<\s]+)\s*</loc>", xml_text)
-    urls = []
-    for u in locs:
-        u = u.strip()
-        if u.startswith(BASE_SITE):
-            urls.append(u)
-    return list(dict.fromkeys(urls))
-
-
-def get_sitemap_urls(limit: int = 300) -> List[str]:
-    now = time.time()
-    if now - float(_SITEMAP_CACHE.get("ts", 0.0)) < _SITEMAP_TTL_SECONDS and isinstance(_SITEMAP_CACHE.get("urls"), list):
-        urls = _SITEMAP_CACHE["urls"]
-        return urls[:limit]
-
-    urls: List[str] = []
-    try:
-        r = requests.get(SITEMAP_URL, timeout=15, headers={"User-Agent": USER_AGENT})
-        r.raise_for_status()
-        urls = _parse_sitemap_urls(r.text)
-    except Exception:
-        urls = []
-
-    # cache even if empty (avoid hammering)
-    _SITEMAP_CACHE["ts"] = now
-    _SITEMAP_CACHE["urls"] = urls
-    return urls[:limit]
-
-
-def _candidate_urls(question: str) -> List[str]:
-    terms = _tokenize(question)
-    # Always include these
-    base = get_main_site_urls()
-    blog = get_blog_urls(max_posts=30)
-
-    # From sitemap, pick likely URLs first by URL string match
-    sm = get_sitemap_urls(limit=500)
-    ranked: List[Tuple[int, str]] = []
-    for u in sm:
-        score = 0
-        lu = u.lower()
-        for t in set(terms):
-            if t in lu:
-                score += 2
-        # Small bias for likely content pages
-        if lu.endswith(".html"):
-            score += 1
-        if score > 0:
-            ranked.append((score, u))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    sm_candidates = [u for _, u in ranked[:60]]  # keep it bounded
-
-    # De-dup, preserve order
-    out: List[str] = []
-    for u in base + sm_candidates + blog:
-        if u.startswith(BASE_SITE) and u not in out:
-            out.append(u)
-
-    return out
+        return []
 
 
 def score_text_match(query: str, text: str) -> int:
-    q_terms = _tokenize(query)
+    q_terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 3]
     if not q_terms:
         return 0
-    t = (text or "").lower()
+    t = text.lower()
     score = 0
     for term in set(q_terms):
         if term in t:
-            score += 1
+            score += 2
+    # bonus if page contains "pre-requisites"/"prerequisites"
+    if "pre-requisites" in t or "prerequisites" in t:
+        score += 1
     return score
 
 
-def retrieve_site_context(
-    question: str,
-    urls: List[str],
-    top_k: int = 6,
-    max_chars: int = 6500,
-) -> List[Dict[str, str]]:
-    scored: List[Tuple[int, str, str]] = []
-    for u in urls:
+def extract_best_sentences(question: str, text: str, max_sentences: int = 2) -> str:
+    """
+    Pulls a short direct answer from page text: choose sentences containing query terms.
+    """
+    q_terms = [t for t in re.findall(r"[a-z0-9]+", question.lower()) if len(t) >= 3]
+    if not q_terms:
+        return ""
+
+    # sentence split (simple)
+    sentences = re.split(r"(?<=[\.\?\!])\s+", text)
+    scored: List[Tuple[int, str]] = []
+    for s in sentences:
+        sl = s.lower()
+        hits = sum(1 for t in set(q_terms) if t in sl)
+        if hits > 0 and 25 <= len(s) <= 220:
+            scored.append((hits, s.strip()))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    picked = []
+    for _, s in scored[:max_sentences]:
+        picked.append(s)
+    return " ".join(picked).strip()
+
+
+def site_answer(question: str, max_pages_to_scan: int = 18) -> Optional[str]:
+    """
+    Searches your site pages and extracts a direct answer.
+    """
+    urls = fetch_sitemap_urls(limit=250)
+    # add blog pages too (optional)
+    urls += get_blog_urls(max_posts=30)
+    urls = list(dict.fromkeys([u for u in urls if u.startswith(BASE_SITE)]))
+
+    # Score URLs quickly by scanning a small chunk of each page text
+    scored_urls: List[Tuple[int, str]] = []
+    for u in urls[:250]:
         txt = fetch_page_text(u)
         if not txt:
             continue
         s = score_text_match(question, txt)
-        if s <= 0:
+        if s > 0:
+            scored_urls.append((s, u))
+    scored_urls.sort(key=lambda x: x[0], reverse=True)
+
+    # Scan top N pages and try extracting an answer
+    for _, u in scored_urls[:max_pages_to_scan]:
+        txt = fetch_page_text(u)
+        if not txt:
             continue
-        scored.append((s, u, txt))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+        # special strong extraction for age/prerequisites
+        ql = question.lower()
+        if any(k in ql for k in ["age", "years old", "minimum age", "prerequisite", "pre-requisite", "required"]):
+            # try to find an explicit "Be XX years" / "Be at least XX years"
+            m = re.search(r"(?i)\bBe\s+(?:at\s+least\s+)?(\d{1,2})\s+years?\b", txt)
+            if m:
+                age = m.group(1)
+                # build a clean direct answer
+                return f"Minimum age requirement is {age} years old."
 
-    out: List[Dict[str, str]] = []
-    for s, u, txt in scored[:top_k]:
-        snippet = txt[: min(len(txt), 1500)]
-        out.append({"url": u, "snippet": snippet})
+        snippet = extract_best_sentences(question, txt, max_sentences=2)
+        if snippet:
+            # Make it cleaner (remove repeated nav/footer-like fragments)
+            snippet = re.sub(r"\s*(Contact us|Calendar|Prices)\s*", " ", snippet, flags=re.I).strip()
+            return snippet
 
-    # Trim combined size
-    total = 0
-    trimmed: List[Dict[str, str]] = []
-    for item in out:
-        chunk = f"URL: {item['url']}\nTEXT: {item['snippet']}\n\n"
-        if total + len(chunk) > max_chars:
-            break
-        trimmed.append(item)
-        total += len(chunk)
-    return trimmed
+    return None
 
 
+# -----------------------------
+# Web search (optional)
+# -----------------------------
 def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
-    """
-    Uses SearchApi.io Google Search API.
-    Docs: https://www.searchapi.io/docs/google
-    """
     api_key = _env("SEARCHAPI_KEY")
     if not api_key:
         return []
-
     try:
         url = "https://www.searchapi.io/api/v1/search"
-        params = {
-            "engine": "google",
-            "q": query,
-            "api_key": api_key,
-            "hl": "en",
-            "gl": "us",
-            "page": 1,
-        }
+        params = {"engine": "google", "q": query, "api_key": api_key, "hl": "en", "gl": "us", "page": 1}
         r = requests.get(url, params=params, timeout=15)
         r.raise_for_status()
         data = r.json() or {}
-
         organic = data.get("organic_results") or []
         out: List[Dict[str, str]] = []
         for item in organic[:k]:
             out.append(
-                {
-                    "title": str(item.get("title", "")),
-                    "link": str(item.get("link", "")),
-                    "snippet": str(item.get("snippet", "")),
-                }
+                {"title": str(item.get("title", "")), "link": str(item.get("link", "")), "snippet": str(item.get("snippet", ""))}
             )
         return out
     except Exception:
         return []
+
+
+def web_answer(question: str) -> Optional[str]:
+    """
+    Very light web fallback: if SearchAPI returns a good snippet, answer with that snippet.
+    """
+    results = searchapi_web_search(question, k=5)
+    for r in results:
+        snip = (r.get("snippet") or "").strip()
+        if len(snip) >= 30:
+            return snip
+    return None
 
 
 # -----------------------------
@@ -343,16 +300,12 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
     pass_ok = secrets.compare_digest(credentials.password or "", expected_pass or "")
 
     if not (user_ok and pass_ok):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
 
 # -----------------------------
-# Email notify via SendGrid API (Render-safe: HTTPS)
+# Email notify via SendGrid API
 # -----------------------------
 def send_owner_email(subject: str, body: str) -> None:
     owner_to = _env("OWNER_NOTIFY_EMAIL")
@@ -373,10 +326,7 @@ def send_owner_email(subject: str, body: str) -> None:
     try:
         r = requests.post(
             "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload,
             timeout=15,
         )
@@ -395,20 +345,18 @@ _calendar_cache: Dict[str, Any] = {"ts": 0.0, "events": []}
 
 def fetch_calendar_events() -> List[str]:
     now = time.time()
-    if now - float(_calendar_cache.get("ts", 0.0)) < 600 and isinstance(_calendar_cache.get("events"), list):
-        return _calendar_cache["events"]
+    if now - float(_calendar_cache.get("ts", 0)) < 600 and isinstance(_calendar_cache.get("events"), list):
+        return list(_calendar_cache["events"])
 
     try:
-        r = requests.get(CALENDAR_URL, timeout=10, headers={"User-Agent": USER_AGENT})
+        r = requests.get(CALENDAR_URL, timeout=10)
         r.raise_for_status()
         html = r.text
-
         date_regex = re.compile(
             r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}\b",
             re.IGNORECASE,
         )
         dates = list(dict.fromkeys(date_regex.findall(html)))[:5]
-
         _calendar_cache["ts"] = now
         _calendar_cache["events"] = dates
         return dates
@@ -419,163 +367,23 @@ def fetch_calendar_events() -> List[str]:
 
 
 # -----------------------------
-# Intent detection (minimal rules)
-# -----------------------------
-def needs_human_confirmation(question: str) -> bool:
-    q = (question or "").lower()
-    # Only use human-confirm flow for booking/availability-like requests
-    return any(
-        k in q
-        for k in [
-            "book",
-            "booking",
-            "reserve",
-            "reservation",
-            "availability",
-            "available",
-            "calendar",
-            "date",
-            "dates",
-            "schedule",
-            "time slot",
-        ]
-    )
-
-
-# -----------------------------
-# Gemini with grounding (site -> web fallback)
-# -----------------------------
-def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
-    api_key = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    if not api_key:
-        return None
-
-    model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
-
-    # 1) Site grounding (uses sitemap candidates so you don't miss pages like Freediver.html prerequisites)
-    candidates = _candidate_urls(question)
-    site_ctx = retrieve_site_context(question, candidates, top_k=6)
-
-    # 2) Web grounding only if site didn't match
-    web_ctx: List[Dict[str, str]] = []
-    if not site_ctx:
-        web_ctx = searchapi_web_search(question, k=5)
-
-    dates = fetch_calendar_events()
-    cal_context = (
-        "Upcoming dates: " + ", ".join(dates)
-        if dates
-        else "Calendar: no upcoming dates listed (must confirm with instructor)."
-    )
-
-    grounding_text = ""
-    if site_ctx:
-        grounding_text += "SITE SOURCES:\n" + "\n\n".join(
-            [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in site_ctx]
-        )
-    if web_ctx:
-        grounding_text += "\n\nWEB RESULTS:\n" + "\n\n".join(
-            [f"TITLE: {w['title']}\nURL: {w['link']}\nSNIPPET: {w['snippet']}" for w in web_ctx]
-        )
-
-    # IMPORTANT: user wants direct answers (no “I found…” / no link-dumps)
-    # If SHOW_SOURCES=1, we will append sources at the very end for debugging only.
-    system = (
-        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan.\n"
-        "Answer the user's question directly and clearly in 1–6 sentences.\n"
-        "Do NOT say phrases like: 'I found relevant info', 'I couldn’t find this', 'Try opening the page'.\n"
-        "Do NOT list URLs unless the user explicitly asks for a link.\n"
-        "If you used the provided sources, silently use them to answer.\n"
-        "If the answer is not supported by sources, give a best-effort general answer without mentioning that sources are missing.\n\n"
-        f"{cal_context}\n"
-    )
-
-    # Build prompt
-    msgs: List[Dict[str, str]] = [
-        {"role": "system", "content": system + ("\n\n" + grounding_text if grounding_text else "")}
-    ]
-
-    if history:
-        for m in history[-10:]:
-            role = (m.get("role") or "").strip()
-            content = (m.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
-                msgs.append({"role": role, "content": content})
-
-    msgs.append({"role": "user", "content": question})
-
-    # --- Try new SDK first: google-genai ---
-    try:
-        from google import genai  # type: ignore
-
-        client = genai.Client(api_key=api_key)
-        prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
-
-        resp = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config={"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 350},
-        )
-        text = getattr(resp, "text", None)
-        if text and str(text).strip():
-            out = str(text).strip()
-            if SHOW_SOURCES and site_ctx:
-                out += "\n\n(Sources used: " + ", ".join([c["url"] for c in site_ctx[:3]]) + ")"
-            return out
-    except Exception as e:
-        # Make the 429 visible in logs, but do NOT break the user flow
-        print(f"Gemini FAILED (new SDK): {type(e).__name__}: {e}")
-
-    # --- Fallback old SDK: google-generativeai ---
-    try:
-        import google.generativeai as genai_old  # type: ignore
-
-        genai_old.configure(api_key=api_key)
-        gm = genai_old.GenerativeModel(
-            model_name=model,
-            system_instruction=system + ("\n\n" + grounding_text if grounding_text else ""),
-        )
-
-        prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs if m["role"] != "system"])
-        r = gm.generate_content(
-            prompt,
-            generation_config={"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 350},
-        )
-        text = getattr(r, "text", None)
-        if text and str(text).strip():
-            out = str(text).strip()
-            if SHOW_SOURCES and site_ctx:
-                out += "\n\n(Sources used: " + ", ".join([c["url"] for c in site_ctx[:3]]) + ")"
-            return out
-    except Exception as e:
-        print(f"Gemini FAILED (old SDK): {type(e).__name__}: {e}")
-
-    return None
-
-
-# -----------------------------
-# Fallback answer (when Gemini quota/timeouts)
+# Minimal fallback
 # -----------------------------
 def fallback_answer(question: str) -> str:
-    q = (question or "").strip().lower()
-
-    # Minimal helpful fallbacks
+    q = question.strip().lower()
     if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
-        return "You can see prices on the Prices page."
-
+        return "Prices are here: https://www.aboodfreediver.com/Prices.php?lang=en"
     if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
         phone = _env("CONTACT_PHONE", default="")
         email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
         whatsapp = _env("CONTACT_WHATSAPP", default=phone)
-        parts = []
+        msg = "You can contact us here:\n"
         if whatsapp:
-            parts.append(f"Phone/WhatsApp: {whatsapp}")
-        if email:
-            parts.append(f"Email: {email}")
-        return " | ".join(parts) if parts else "You can contact us via the website contact form."
-
-    # Generic
-    return "Tell me what you want to do (beginner try, course, fun dive, or training days) and I’ll recommend the best option."
+            msg += f"Phone/WhatsApp: {whatsapp}\n"
+        msg += f"Email: {email}\n"
+        msg += "Form: https://www.aboodfreediver.com/form1.php"
+        return msg
+    return "Please tell me what you want to do (beginner try, course, fun dive, or training days) and I’ll recommend the best option."
 
 
 # -----------------------------
@@ -600,33 +408,76 @@ def chat(req: ChatRequest):
     )
     convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
 
-    # Determine if this needs human confirmation
-    needs_human = needs_human_confirmation(question)
+    q = question.lower().strip()
 
-    # Try Gemini (site-grounded; web fallback)
-    answer = try_gemini_answer(question, req.history)
+    # Human-needed detection (booking/availability)
+    needs_human = any(
+        k in q
+        for k in [
+            "availability",
+            "available",
+            "calendar",
+            "date",
+            "dates",
+            "schedule",
+            "time slot",
+            "book",
+            "booking",
+            "reserve",
+            "reservation",
+            "confirm",
+        ]
+    )
 
-    if answer:
+    # 1) Try answer from your website (DIRECT answer, no links)
+    ans = site_answer(question)
+    if ans:
         if needs_human:
             convo["needs_human"] = True
             send_owner_email(
                 subject="Aqua needs confirmation (booking/availability)",
-                body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
+                body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nOpen admin:\n/admin",
             )
-        convo["messages"].append({"role": "assistant", "text": answer, "ts": datetime.now(timezone.utc).isoformat()})
-        return ChatResponse(answer=answer, session_id=session_id, needs_human=needs_human, source="gemini")
+        convo["messages"].append({"role": "assistant", "text": ans, "ts": datetime.now(timezone.utc).isoformat()})
+        return ChatResponse(answer=ans, session_id=session_id, needs_human=needs_human, source="site")
 
-    # Gemini failed (quota/timeout/etc.) -> simple fallback answer
-    answer2 = fallback_answer(question)
+    # 2) Calendar quick answer (still direct)
+    if any(k in q for k in ["availability", "available", "calendar", "date", "dates", "schedule"]):
+        dates = fetch_calendar_events()
+        if dates:
+            ans2 = "Upcoming dates: " + ", ".join(dates) + ". Tell me your preferred day/time and I’ll confirm."
+        else:
+            ans2 = "We’re usually free if nothing is scheduled, but I must confirm with the instructor. Tell me your preferred day/time."
+        convo["needs_human"] = True
+        send_owner_email(
+            subject="Aqua needs confirmation (availability)",
+            body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nOpen admin:\n/admin",
+        )
+        convo["messages"].append({"role": "assistant", "text": ans2, "ts": datetime.now(timezone.utc).isoformat()})
+        return ChatResponse(answer=ans2, session_id=session_id, needs_human=True, source="rules")
+
+    # 3) Web fallback (direct snippet)
+    ans3 = web_answer(question)
+    if ans3:
+        if needs_human:
+            convo["needs_human"] = True
+            send_owner_email(
+                subject="Aqua needs confirmation (booking/availability)",
+                body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nOpen admin:\n/admin",
+            )
+        convo["messages"].append({"role": "assistant", "text": ans3, "ts": datetime.now(timezone.utc).isoformat()})
+        return ChatResponse(answer=ans3, session_id=session_id, needs_human=needs_human, source="web")
+
+    # 4) Final fallback
+    ans4 = fallback_answer(question)
     if needs_human:
         convo["needs_human"] = True
         send_owner_email(
             subject="Aqua needs confirmation (booking/availability)",
-            body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
+            body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nOpen admin:\n/admin",
         )
-
-    convo["messages"].append({"role": "assistant", "text": answer2, "ts": datetime.now(timezone.utc).isoformat()})
-    return ChatResponse(answer=answer2, session_id=session_id, needs_human=needs_human, source="fallback")
+    convo["messages"].append({"role": "assistant", "text": ans4, "ts": datetime.now(timezone.utc).isoformat()})
+    return ChatResponse(answer=ans4, session_id=session_id, needs_human=needs_human, source="fallback")
 
 
 @app.get("/chat/status")
