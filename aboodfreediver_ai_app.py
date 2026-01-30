@@ -610,8 +610,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
 
     # 2) Web search only if site/blog didn't match
     web_ctx: List[Dict[str, str]] = []
-    external_agency = any(k in question.lower() for k in ["padi", "aida", "molchanovs", "ssi"]) 
-    if ((not have_grounding) and confidence < 0.35) or external_agency:
+    if (not have_grounding) and confidence < 0.35:
         web_ctx = searchapi_web_search(question, k=5)
 
     dates = fetch_calendar_events()
@@ -639,10 +638,10 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\nYou ONLY answer questions about freediving, freediving training/safety, and Abood Freediver services.\nIf the user asks about topics unrelated to freediving/Abood Freediver, say you can’t help with that and ask them to rephrase a freediving-related question.\n"
         "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n"
         "Respond in the same language as the user (Arabic if they write Arabic, otherwise English).\n\n"
-        "Hard business rules (the ONLY thing that requires human confirmation is booking/availability):\n"
-        "1) If asked about prices: answer with the exact prices if they appear in MAIN SITE / SERVICES sources; also include this link for reference: https://www.aboodfreediver.com/Prices.php?lang=en\n"
+        "Hard business rules:\n"
+        "1) If asked about prices, link to: https://www.aboodfreediver.com/Prices.php?lang=en\n"
         "2) If asked about contact/booking, link to: https://www.aboodfreediver.com/form1.php\n"
-        "3) If asked about availability/dates (requires instructor confirmation):\n"
+        "3) If asked about availability/dates:\n"
         "   - If calendar has events, mention the next dates.\n"
         "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n\n"
         "Content rules (IMPORTANT):\n"
