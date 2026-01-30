@@ -259,7 +259,7 @@ def get_main_site_urls() -> List[str]:
 _SERVICE_URLS_CACHE: Dict[str, Any] = {"ts": 0.0, "urls": []}
 _SERVICE_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
-def get_service_urls(max_urls: int = 80) -> List[str]:
+def get_service_urls(max_urls: int = 25) -> List[str]:
     """Discover additional internal service pages so Aqua can answer without keyword rules."""
     now = time.time()
     if now - float(_SERVICE_URLS_CACHE.get("ts", 0)) < _SERVICE_CACHE_TTL_SECONDS and _SERVICE_URLS_CACHE.get("urls"):
@@ -330,36 +330,38 @@ def retrieve_site_context(
     urls: List[str],
     top_k: int = 4,
     max_chars: int = 4000,
+    time_budget: float = 3.0,  # seconds
 ) -> List[Dict[str, str]]:
+    start = time.time()
     scored: List[Tuple[int, str, str]] = []
+
     for u in urls:
+        if time.time() - start > time_budget:
+            break  # ⬅️ prevents timeout
+
         txt = fetch_page_text(u)
         if not txt:
             continue
+
         s = score_text_match(question, txt)
         if s <= 0:
             continue
+
         scored.append((s, u, txt))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     out: List[Dict[str, str]] = []
+    total = 0
     for s, u, txt in scored[:top_k]:
         snippet = txt[: min(len(txt), 1200)]
-        out.append({"url": u, "snippet": snippet})
-
-    # Trim combined size
-    total = 0
-    trimmed: List[Dict[str, str]] = []
-    for item in out:
-        chunk = f"URL: {item['url']}\nTEXT: {item['snippet']}\n\n"
-        if total + len(chunk) > max_chars:
+        chunk_len = len(snippet)
+        if total + chunk_len > max_chars:
             break
-        trimmed.append(item)
-        total += len(chunk)
+        out.append({"url": u, "snippet": snippet})
+        total += chunk_len
 
-    _log("SITE_CTX pages:", len(trimmed))
-    return trimmed
+    return out
 
 
 # -----------------------------
