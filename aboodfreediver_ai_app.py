@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 import time
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -12,7 +13,7 @@ import requests
 from urllib.parse import urljoin
 import html as html_lib
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -39,6 +40,56 @@ security = HTTPBasic()
 # In-memory storage (Render free tier resets on deploy/sleep)
 # -----------------------------
 CONVERSATIONS: Dict[str, Dict[str, Any]] = {}
+
+# -----------------------------
+# Realtime hub (in-memory pub/sub per session)
+# -----------------------------
+# session_id -> set of asyncio.Queue for user/admin listeners
+_SESSION_LISTENERS: Dict[str, List[asyncio.Queue]] = {}
+
+# admin auth tokens (short-lived) for websocket access
+_ADMIN_WS_TOKENS: Dict[str, Dict[str, Any]] = {}  # token -> {"exp": float}
+
+def _ws_token_new(ttl_seconds: int = 1800) -> str:
+    token = secrets.token_urlsafe(32)
+    _ADMIN_WS_TOKENS[token] = {"exp": time.time() + ttl_seconds}
+    return token
+
+def _ws_token_valid(token: str) -> bool:
+    data = _ADMIN_WS_TOKENS.get(token)
+    if not data:
+        return False
+    if time.time() > float(data.get("exp", 0)):
+        _ADMIN_WS_TOKENS.pop(token, None)
+        return False
+    return True
+
+def _listeners_for(session_id: str) -> List[asyncio.Queue]:
+    return _SESSION_LISTENERS.setdefault(session_id, [])
+
+def _listener_add(session_id: str) -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue(maxsize=200)
+    _listeners_for(session_id).append(q)
+    return q
+
+def _listener_remove(session_id: str, q: asyncio.Queue) -> None:
+    listeners = _SESSION_LISTENERS.get(session_id) or []
+    try:
+        listeners.remove(q)
+    except ValueError:
+        pass
+    if not listeners:
+        _SESSION_LISTENERS.pop(session_id, None)
+
+def _broadcast(session_id: str, payload: Dict[str, Any]) -> None:
+    listeners = list(_SESSION_LISTENERS.get(session_id) or [])
+    for q in listeners:
+        try:
+            q.put_nowait(payload)
+        except Exception:
+            # if full or closed, ignore; clients can reconnect
+            pass
+
 # session_id -> {
 #   "messages": [{role, text, ts}],
 #   "needs_human": bool,
@@ -200,6 +251,51 @@ def get_main_site_urls() -> List[str]:
         urljoin(BASE_SITE, "C-130.html"),
         urljoin(BASE_SITE, "Tank.html"),
     ]
+
+
+# -----------------------------
+# Service page discovery (crawl internal links from key pages)
+# -----------------------------
+_SERVICE_URLS_CACHE: Dict[str, Any] = {"ts": 0.0, "urls": []}
+_SERVICE_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+
+def get_service_urls(max_urls: int = 80) -> List[str]:
+    """Discover additional internal service pages so Aqua can answer without keyword rules."""
+    now = time.time()
+    if now - float(_SERVICE_URLS_CACHE.get("ts", 0)) < _SERVICE_CACHE_TTL_SECONDS and _SERVICE_URLS_CACHE.get("urls"):
+        return list(_SERVICE_URLS_CACHE["urls"])
+
+    seed_pages = [
+        urljoin(BASE_SITE, "index.html"),
+        urljoin(BASE_SITE, "FAQ.html"),
+        urljoin(BASE_SITE, "Discoverfreediving.html"),
+        urljoin(BASE_SITE, "BasicFreediver.html"),
+        urljoin(BASE_SITE, "Freediver.html"),
+        urljoin(BASE_SITE, "Advancedfreediver.html"),
+    ]
+
+    urls: List[str] = []
+    for seed in seed_pages:
+        try:
+            r = requests.get(seed, timeout=12, headers={"User-Agent": "AquaBot/1.0"})
+            r.raise_for_status()
+            urls.extend(extract_links(r.text, seed))
+        except Exception:
+            continue
+
+    cleaned: List[str] = []
+    for link in urls:
+        if not link.startswith(BASE_SITE):
+            continue
+        if re.search(r"\.(html|php)$", link, re.I):
+            cleaned.append(link)
+
+    cleaned = list(dict.fromkeys(cleaned))
+    merged = list(dict.fromkeys(get_main_site_urls() + cleaned))[:max_urls]
+
+    _SERVICE_URLS_CACHE["ts"] = now
+    _SERVICE_URLS_CACHE["urls"] = merged
+    return merged
 
 
 def get_blog_urls(max_posts: int = 30) -> List[str]:
@@ -376,7 +472,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
 
     # 1) Retrieve context: main site -> blog
-    main_ctx = retrieve_site_context(question, get_main_site_urls())
+    main_ctx = retrieve_site_context(question, get_service_urls())
     blog_ctx: List[Dict[str, str]] = []
     if not main_ctx:
         blog_ctx = retrieve_site_context(question, get_blog_urls())
@@ -410,7 +506,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         )
 
     system = (
-        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\n"
+        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\nYou ONLY answer questions about freediving, freediving training/safety, and Abood Freediver services.\nIf the user asks about topics unrelated to freediving/Abood Freediver, say you can’t help with that and ask them to rephrase a freediving-related question.\n"
         "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n\n"
         "Hard business rules:\n"
         "1) If asked about prices, link to: https://www.aboodfreediver.com/Prices.php?lang=en\n"
@@ -420,7 +516,7 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
         "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n\n"
         "Content rules (IMPORTANT):\n"
         "- Use ONLY the provided MAIN SITE / BLOG SOURCES and (if present) WEB RESULTS for factual claims.\n"
-        "- If the answer is not in those sources, say exactly: \"I couldn’t find this on the website/blog.\" "
+        "- If the answer is not in those sources, say exactly: \"\" "
         "Then provide a short best-effort general answer.\n"
         "- When you use info from sources, cite the URL(s) in the answer.\n"
     )
@@ -484,62 +580,44 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     return None
 
 
+
+def is_freediving_related(question: str) -> bool:
+    q = question.lower()
+    # allow common business interactions
+    if any(k in q for k in ["price", "prices", "cost", "how much", "fee",
+                           "book", "booking", "reserve", "reservation",
+                           "availability", "available", "calendar", "date", "dates", "schedule", "time slot",
+                           "whatsapp", "phone", "contact", "email", "number",
+                           "open", "opening", "hours", "working hours",
+                           "aqaba", "abood", "red sea", "jordan"]):
+        return True
+
+    # core freediving + diving topics
+    keywords = [
+        "freediv", "free div", "apnea", "breath hold", "breathhold",
+        "equaliz", "frenzel", "valsalva", "mask", "fins", "monofin",
+        "wetsuit", "neck weight", "lanyard", "buoy", "float", "line",
+        "depth", "dynamic", "static", "cwt", "cnf", "fimt", "no fins",
+        "safety", "rescue", "blackout", "samba", "hypoxia",
+        "course", "cert", "certification", "aida", "molchanovs", "ssi",
+        "training", "coach", "instructor", "session", "dive site", "divesite",
+        "equipment", "weight", "weights", "ear", "sinus", "pressure",
+    ]
+    return any(k in q for k in keywords)
+
+
 # -----------------------------
 # Fallback logic
 # -----------------------------
 def fallback_answer(question: str) -> Tuple[str, bool]:
     q = question.strip().lower()
-
-    if any(k in q for k in ["price", "prices", "cost", "how much", "fee"]):
-        return ("Prices are here: https://www.aboodfreediver.com/Prices.php?lang=en", False)
-
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
-    if any(k in q for k in ["book", "booking", "reserve", "reservation"]):
-        return (
-            f"To book, please fill this form: {FORM_URL} "
-            "(or tell me the date/time you want and I will confirm availability).",
-            True,
-        )
+    # Minimal safe fallback if Gemini is unavailable
+    if any(k in q for k in ["book", "booking", "reserve", "reservation", "availability", "available", "date", "dates", "schedule"]):
+        return (f"Please share your preferred date/time and I will confirm availability. Booking form: {FORM_URL}", True)
 
-    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
-        phone = _env("CONTACT_PHONE", default="")
-        email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
-        whatsapp = _env("CONTACT_WHATSAPP", default=phone)
-
-        msg = "You can contact us here:\n"
-        if whatsapp:
-            msg += f"Phone/WhatsApp: {whatsapp}\n"
-        msg += f"Email: {email}\n"
-        msg += f"Form: {FORM_URL}"
-        return (msg, False)
-
-    if any(
-        k in q
-        for k in ["availability", "available", "calendar", "date", "dates", "schedule", "time slot", "time are you free"]
-    ):
-        dates = fetch_calendar_events()
-        if dates:
-            return (
-                "Upcoming calendar dates: " + ", ".join(dates) + ". "
-                "Tell me the day/time you want and I’ll confirm with the instructor.",
-                True,
-            )
-        return (
-            "We’re usually free if nothing is scheduled on the calendar, but I must confirm with the instructor first. "
-            "Tell me the day/time you want.",
-            True,
-        )
-
-    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env("OPENING_HOURS", default=f"Opening hours: please use the contact form to confirm today: {FORM_URL}")
-        return (hours, False)
-
-    if any(k in q for k in ["hello", "hi", "hey", "good morning", "good evening"]):
-        return ("Hi, I’m Aqua. Ask me about courses, prices, safety, or availability in Aqaba.", False)
-
-    return ("Ask me about freediving courses, prices, safety, or availability in Aqaba.", False)
-
+    return ("I can help with freediving training, safety, equipment, courses, and Abood Freediver services in Aqaba. What would you like to know?", False)
 
 # -----------------------------
 # Routes
@@ -568,48 +646,12 @@ def chat(req: ChatRequest):
         {"messages": [], "needs_human": False, "created": datetime.now(timezone.utc).isoformat()},
     )
     convo["messages"].append({"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
+    _broadcast(session_id, {"role": "user", "text": question, "ts": datetime.now(timezone.utc).isoformat()})
 
     q = question.lower().strip()
     FORM_URL = "https://www.aboodfreediver.com/form1.php"
 
-    # RULE OVERRIDES (NO NOTIFY)
-    if any(k in q for k in ["open", "opening", "hours", "working hours", "what time do you open", "what time are you open"]):
-        hours = _env("OPENING_HOURS", default="Open daily 9:00-17:00 (Aqaba time).")
-        return ChatResponse(answer=hours, session_id=session_id, needs_human=False, source="rules")
-
-    if any(k in q for k in ["whatsapp", "phone", "contact", "email", "number"]):
-        phone = _env("CONTACT_PHONE", default="")
-        email = _env("CONTACT_EMAIL", default="free@aboodfreediver.com")
-        whatsapp = _env("CONTACT_WHATSAPP", default=phone)
-
-        msg = "You can contact us here:\n"
-        if whatsapp:
-            msg += f"Phone/WhatsApp: {whatsapp}\n"
-        msg += f"Email: {email}\n"
-        msg += f"Form: {FORM_URL}"
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
-
-    # IMPORTANT FIX:
-    # Previously, ANY "course" question was being answered by this canned list,
-    # which blocks Gemini from answering "age/requirements/prerequisites".
-    course_terms = ["courses", "course", "levels", "learn", "training", "certification"]
-    requirement_terms = [
-        "age", "old", "minimum", "min", "years",
-        "require", "required", "requirements", "prerequisite", "prerequisites",
-        "medical", "doctor", "fit", "fitness", "health",
-        "can i", "allowed", "eligibility",
-    ]
-
-    if any(t in q for t in course_terms) and not any(t in q for t in requirement_terms):
-        msg = (
-            "We offer freediving courses for all levels:\n"
-            "- Discovery Freediver (beginner try)\n"
-            "- Freediver (Level 1)\n"
-            "- Advanced Freediver (Level 2)\n"
-            "- Master Freediver (Level 3)\n\n"
-            "Tell me your experience level and how many days you have, and I’ll recommend the best option."
-        )
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
+    # RULE OVERRIDES removed: Aqua now searches sources instead of keyword answers.
 
     # try gemini (site -> blog -> web)
     answer = try_gemini_answer(question, req.history)
@@ -628,6 +670,7 @@ def chat(req: ChatRequest):
                 body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
             )
         convo["messages"].append({"role": "assistant", "text": answer, "ts": datetime.now(timezone.utc).isoformat()})
+        _broadcast(session_id, {"role": "assistant", "text": answer, "ts": datetime.now(timezone.utc).isoformat(), "needs_human": needs_human})
         return ChatResponse(answer=answer, session_id=session_id, needs_human=needs_human, source="gemini")
 
     # fallback
@@ -639,6 +682,7 @@ def chat(req: ChatRequest):
             body=f"Session: {session_id}\n\nUser asked:\n{question}\n\nReply from admin page:\n/admin",
         )
     convo["messages"].append({"role": "assistant", "text": answer2, "ts": datetime.now(timezone.utc).isoformat()})
+    _broadcast(session_id, {"role": "assistant", "text": answer2, "ts": datetime.now(timezone.utc).isoformat(), "needs_human": needs_human2})
     return ChatResponse(answer=answer2, session_id=session_id, needs_human=needs_human2, source="fallback")
 
 
@@ -657,8 +701,75 @@ def human_reply(data: HumanReply, _: bool = Depends(admin_auth)):
         raise HTTPException(status_code=404, detail="Session not found")
 
     convo["messages"].append({"role": "human", "text": data.message, "ts": datetime.now(timezone.utc).isoformat()})
+    _broadcast(data.session_id, {"role": "human", "text": data.message, "ts": datetime.now(timezone.utc).isoformat(), "needs_human": False})
     convo["needs_human"] = False
     return {"ok": True}
+
+
+
+@app.get("/admin/token")
+def admin_ws_token(_: bool = Depends(admin_auth)):
+    # short-lived token used for websocket auth
+    return {"token": _ws_token_new(ttl_seconds=1800)}
+
+
+@app.websocket("/ws/user/{session_id}")
+async def ws_user(session_id: str, ws: WebSocket):
+    await ws.accept()
+    q = _listener_add(session_id)
+    try:
+        # send current history snapshot
+        convo = CONVERSATIONS.get(session_id) or {"messages": [], "needs_human": False}
+        await ws.send_json({"type": "snapshot", "session_id": session_id, "needs_human": convo.get("needs_human", False), "messages": convo.get("messages", [])})
+
+        while True:
+            payload = await q.get()
+            await ws.send_json({"type": "event", "session_id": session_id, **payload})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        _listener_remove(session_id, q)
+
+
+@app.websocket("/ws/admin/{session_id}")
+async def ws_admin(session_id: str, ws: WebSocket, token: str = Query(default="")):
+    # token is required for admin websocket
+    if not token or not _ws_token_valid(token):
+        # 1008 = policy violation
+        await ws.close(code=1008)
+        return
+
+    await ws.accept()
+    q = _listener_add(session_id)
+    try:
+        convo = CONVERSATIONS.get(session_id) or {"messages": [], "needs_human": False}
+        await ws.send_json({"type": "snapshot", "session_id": session_id, "needs_human": convo.get("needs_human", False), "messages": convo.get("messages", [])})
+
+        while True:
+            data = await ws.receive_json()
+            msg = str((data or {}).get("message", "")).strip()
+            if not msg:
+                continue
+
+            convo2 = CONVERSATIONS.get(session_id)
+            if not convo2:
+                # create if admin starts first
+                convo2 = CONVERSATIONS.setdefault(
+                    session_id,
+                    {"messages": [], "needs_human": False, "created": datetime.now(timezone.utc).isoformat()},
+                )
+
+            convo2["messages"].append({"role": "human", "text": msg, "ts": datetime.now(timezone.utc).isoformat()})
+            convo2["needs_human"] = False
+            _broadcast(session_id, {"role": "human", "text": msg, "ts": datetime.now(timezone.utc).isoformat(), "needs_human": False})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        _listener_remove(session_id, q)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -670,46 +781,142 @@ def admin_page(_: bool = Depends(admin_auth)):
   <title>Aqua – Instructor Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: Arial; padding: 20px; max-width: 760px; margin: 0 auto; }
+    body { font-family: Arial; padding: 20px; max-width: 980px; margin: 0 auto; }
     input, textarea, button { width: 100%; margin: 10px 0; padding: 10px; font-size: 16px; }
-    pre { background: #f5f5f5; padding: 10px; overflow: auto; }
-    small { color: #444; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    .chat { height: 520px; overflow: auto; background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 10px; }
+    .msg { margin: 8px 0; padding: 8px 10px; border-radius: 10px; max-width: 90%; white-space: pre-wrap; }
+    .user { background: #ffffff; border: 1px solid #eee; }
+    .assistant { background: #eef7ff; border: 1px solid #d7ecff; }
+    .human { background: #f5fff1; border: 1px solid #e2ffd7; }
+    .meta { font-size: 12px; color: #555; margin-bottom: 2px; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #eee; font-size: 12px; }
+    .needs { background: #ffe8e8; }
+    .ok { background: #e9ffe8; }
   </style>
 </head>
 <body>
-  <h2>Reply as Human Instructor</h2>
-  <small>Paste the session_id returned by /chat. You can also check messages via /chat/status?session_id=...</small>
+  <h2>Aqua – Admin Real-time Chat</h2>
+  <div class="card">
+    <div class="meta">This page uses HTTP Basic Auth. Enter the session_id from the user chat response.</div>
+    <input id="sid" placeholder="Session ID" />
+    <button onclick="connectWs()">Connect (real-time)</button>
+    <div id="status" class="badge">Disconnected</div>
+  </div>
 
-  <input id="sid" placeholder="Session ID" />
-  <textarea id="msg" rows="4" placeholder="Your reply to the diver"></textarea>
-  <button onclick="send()">Send Reply</button>
+  <div class="row">
+    <div class="card">
+      <h3>Conversation</h3>
+      <div id="chat" class="chat"></div>
+    </div>
 
-  <button onclick="loadStatus()">Load chat status</button>
+    <div class="card">
+      <h3>Reply as Human Instructor</h3>
+      <textarea id="msg" rows="4" placeholder="Type your reply..."></textarea>
+      <button onclick="sendHuman()">Send</button>
 
-  <pre id="out"></pre>
+      <h3>Manual tools</h3>
+      <button onclick="loadStatus()">Load chat status (HTTP)</button>
+      <pre id="out"></pre>
+    </div>
+  </div>
 
 <script>
-async function send() {
+let ws = null;
+let wsToken = null;
+
+function esc(s) {
+  return (s || "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderMessage(m) {
+  const role = m.role || 'unknown';
+  const text = m.text || '';
+  const ts = m.ts || '';
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + role;
+  wrap.innerHTML = `<div class="meta">${esc(role)} • ${esc(ts)}</div>${esc(text)}`;
+  return wrap;
+}
+
+function setStatus(text, needsHuman=false) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = 'badge ' + (needsHuman ? 'needs' : 'ok');
+}
+
+async function getToken() {
+  // requires basic auth already accepted by browser
+  const r = await fetch('/admin/token');
+  if (!r.ok) throw new Error('Failed to get token: ' + r.status);
+  const j = await r.json();
+  return j.token;
+}
+
+async function connectWs() {
   const sid = document.getElementById('sid').value.trim();
-  const msg = document.getElementById('msg').value.trim();
-  if (!sid || !msg) {
-    document.getElementById('out').textContent = "Session ID and message are required.";
+  if (!sid) return alert('Session ID is required');
+
+  if (ws) { try { ws.close(); } catch(e) {} ws = null; }
+
+  setStatus('Connecting...', false);
+
+  try {
+    wsToken = await getToken();
+  } catch (e) {
+    setStatus('Token error', true);
+    document.getElementById('out').textContent = String(e);
     return;
   }
-  const res = await fetch('/human', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: sid, message: msg })
-  });
-  document.getElementById('out').textContent = await res.text();
+
+  const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/admin/${encodeURIComponent(sid)}?token=${encodeURIComponent(wsToken)}`);
+
+  ws.onopen = () => setStatus('Connected', false);
+
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if (data.type === 'snapshot') {
+        const chat = document.getElementById('chat');
+        chat.innerHTML = '';
+        (data.messages || []).forEach(m => chat.appendChild(renderMessage(m)));
+        chat.scrollTop = chat.scrollHeight;
+        setStatus('Connected', !!data.needs_human);
+      } else if (data.type === 'event') {
+        const chat = document.getElementById('chat');
+        chat.appendChild(renderMessage(data));
+        chat.scrollTop = chat.scrollHeight;
+        if (typeof data.needs_human !== 'undefined') {
+          setStatus('Connected', !!data.needs_human);
+        }
+      }
+    } catch (e) {
+      document.getElementById('out').textContent = 'WS parse error: ' + e;
+    }
+  };
+
+  ws.onclose = () => setStatus('Disconnected', false);
+  ws.onerror = () => setStatus('WebSocket error', true);
+}
+
+function sendHuman() {
+  const sid = document.getElementById('sid').value.trim();
+  const msg = document.getElementById('msg').value.trim();
+  if (!sid || !msg) return alert('Session ID and message are required');
+
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ message: msg }));
+    document.getElementById('msg').value = '';
+  } else {
+    alert('Not connected. Click Connect first.');
+  }
 }
 
 async function loadStatus() {
   const sid = document.getElementById('sid').value.trim();
-  if (!sid) {
-    document.getElementById('out').textContent = "Enter Session ID first.";
-    return;
-  }
+  if (!sid) return alert('Enter Session ID first.');
   const res = await fetch('/chat/status?session_id=' + encodeURIComponent(sid));
   document.getElementById('out').textContent = await res.text();
 }
