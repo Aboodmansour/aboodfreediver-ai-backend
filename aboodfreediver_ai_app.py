@@ -614,112 +614,10 @@ def fetch_calendar_events() -> List[str]:
 # -----------------------------
 # Gemini (site -> blog -> web; keeps booking/email logic unchanged)
 # -----------------------------
-def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
-    api_key = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
-    if not api_key:
-        _log("GEMINI key missing -> gemini disabled")
-        return None
 
-    model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
-
-    lang = detect_lang(question)
-    ck = _cache_key(question, lang)
-    cached = _cache_get(ck)
-    if cached:
-        return cached
-
-    # 1) Retrieve context: main site -> blog
-    # Course pages are always checked first for course-related questions
-    course_ctx: List[Dict[str, str]] = []
-    if any(k in question.lower() for k in ["course", "courses", "level", "levels", "discover", "basic", "freediver", "advanced", "training", "session", "snorkel"]):
-        course_ctx = retrieve_site_context(question, COURSE_URLS, top_k=4, max_chars=3000, time_budget=1.2)
-    main_ctx = retrieve_site_context(question, get_service_urls())
-    blog_ctx: List[Dict[str, str]] = []
-    if not main_ctx:
-        blog_ctx = retrieve_site_context(question, get_blog_urls())
-
-    have_grounding = bool(course_ctx or main_ctx or blog_ctx)
-
-    # Confidence is based on how strong the site/blog match is.
-    best_score = 0.0
-    try:
-        if _DOC_INDEX.get('docs'):
-            # approximate: max bm25 across docs for this query within a small budget
-            start = time.time()
-            for d in _DOC_INDEX['docs'][:120]:
-                if time.time() - start > 0.25:
-                    break
-                best_score = max(best_score, _bm25_score(question, d))
-    except Exception:
-        pass
-    # scale to 0..1 (heuristic)
-    confidence = max(0.0, min(1.0, best_score / 8.0))
-
-    # 2) Web search only if site/blog didn't match
-    web_ctx: List[Dict[str, str]] = []
-    external_agency = any(k in question.lower() for k in ["padi", "aida", "molchanovs", "ssi"]) 
-    if ((not have_grounding) and confidence < 0.35) or external_agency:
-        web_ctx = searchapi_web_search(question, k=5)
-
-    dates = fetch_calendar_events()
-    cal_context = (
-        "Upcoming dates from the calendar: " + ", ".join(dates)
-        if dates
-        else "Calendar shows no upcoming dates (may mean mostly free; must confirm with instructor)."
-    )
-
-    grounding_text = ""
-    if course_ctx:
-        grounding_text += "COURSE SOURCES:\n" + "\n\n".join(
-            [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in course_ctx]
-        )
-    if main_ctx:
-        grounding_text += "MAIN SITE SOURCES:\n" + "\n\n".join(
-            [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in main_ctx]
-        )
-    if blog_ctx:
-        grounding_text += "\n\nBLOG SOURCES:\n" + "\n\n".join(
-            [f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in blog_ctx]
-        )
-    if web_ctx:
-        grounding_text += "\n\nWEB RESULTS:\n" + "\n\n".join(
-            [f"TITLE: {w['title']}\nURL: {w['link']}\nSNIPPET: {w['snippet']}" for w in web_ctx]
-        )
-
-    system = (
-        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\nYou ONLY answer questions about freediving, freediving training/safety, and Abood Freediver services.\nIf the user asks about topics unrelated to freediving/Abood Freediver, say you can’t help with that and ask them to rephrase a freediving-related question.\n"
-        "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n"
-        "Respond in the same language as the user (Arabic if they write Arabic, otherwise English).\n\n"
-        "Hard business rules (the ONLY thing that requires human confirmation is booking/availability):\n"
-        "1) If asked about prices: answer with the exact prices if they appear in MAIN SITE / SERVICES sources; also include this link for reference: https://www.aboodfreediver.com/Prices.php?lang=en\n"
-        "2) If asked about contact/booking, link to: https://www.aboodfreediver.com/form1.php\n"
-        "3) If asked about availability/dates (requires instructor confirmation):\n"
-        "   - If calendar has events, mention the next dates.\n"
-        "   - If calendar has no events, say we are usually free BUT must confirm with the instructor.\n\n"
-        "Content rules (IMPORTANT):\n"
-        "- Use ONLY the provided MAIN SITE / BLOG SOURCES and (if present) WEB RESULTS for factual claims.\n"
-        "- If the answer is not in those sources, say exactly: \"\" "
-        "Then provide a short best-effort general answer.\n"
-        "- When you use info from sources, cite the URL(s) in the answer.\n"
-    )
-
-    msgs: List[Dict[str, str]] = [
-        {
-            "role": "system",
-            "content": system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else "") + f"\n\nCONFIDENCE_HINT: {confidence:.2f}",
-        }
-    ]
-
-    if history:
-        for m in history[-12:]:
-            role = (m.get("role") or "").strip()
-            content = (m.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
-                msgs.append({"role": role, "content": content})
-
-    msgs.append({"role": "user", "content": question})
-
-    
+# -----------------------------
+# Gemini (site -> blog -> web; keeps booking/email logic unchanged)
+# -----------------------------
 def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optional[str], Optional[str]]:
     """Direct REST call to Gemini API. Returns (text, error)."""
     try:
@@ -746,34 +644,163 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
         return None, f"{type(e).__name__}: {e}"
 
 
-    # --- Try REST first (most reliable) ---
+def _format_web_ctx(web_ctx: List[Dict[str, str]], k: int = 4) -> str:
+    lines: List[str] = []
+    for w in (web_ctx or [])[:k]:
+        title = (w.get("title") or "").strip()
+        link = (w.get("link") or "").strip()
+        snip = (w.get("snippet") or "").strip()
+        if title or snip or link:
+            lines.append(f"- {title}\n  {snip}\n  Source: {link}".strip())
+    return "\n".join(lines).strip()
+
+
+def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) -> Optional[str]:
+    api_key = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    if not api_key:
+        _log("GEMINI key missing -> gemini disabled")
+        return None
+
+    model = _env("GEMINI_MODEL", default="gemini-2.5-flash")
+
+    lang = detect_lang(question)
+    ck = _cache_key(question, lang)
+    cached = _cache_get(ck)
+    if cached:
+        return cached
+
+    # 1) Retrieve context: courses -> main site/services -> blog
+    qlow = question.lower()
+
+    # Course pages are ALWAYS checked first for course-related questions (English + Arabic cues)
+    course_triggers = [
+        "course", "courses", "level", "levels", "discover", "basic", "freediver", "advanced",
+        "training", "session", "snorkel",
+        "دورة", "دورات", "مستوى", "مستويات", "تدريب", "جلسة", "سنوركل",
+    ]
+    course_ctx: List[Dict[str, str]] = []
+    if any(k in qlow for k in course_triggers):
+        course_ctx = retrieve_site_context(question, COURSE_URLS, top_k=4, max_chars=3200, time_budget=1.4)
+
+    # Always search main/services pages for every question (your requirement)
+    main_ctx = retrieve_site_context(question, get_service_urls(), top_k=5, max_chars=4200, time_budget=2.5)
+
+    blog_ctx: List[Dict[str, str]] = []
+    if not main_ctx and not course_ctx:
+        blog_ctx = retrieve_site_context(question, get_blog_urls(), top_k=4, max_chars=3200, time_budget=2.0)
+
+    have_grounding = bool(course_ctx or main_ctx or blog_ctx)
+
+    # Confidence heuristic from BM25
+    best_score = 0.0
     try:
-        prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
+        if _DOC_INDEX.get("docs"):
+            start = time.time()
+            for d in _DOC_INDEX["docs"][:160]:
+                if time.time() - start > 0.35:
+                    break
+                best_score = max(best_score, _bm25_score(question, d))
+    except Exception:
+        pass
+    confidence = max(0.0, min(1.0, best_score / 8.0))
 
-        fallback_models = [m.strip() for m in _env("GEMINI_FALLBACK_MODELS", default="gemini-2.0-flash,gemini-1.5-flash").split(",") if m.strip()]
-        models_to_try = [model] + [m for m in fallback_models if m != model]
+    # 2) Web search only if site/blog didn't match (or user asks about external agencies)
+    web_ctx: List[Dict[str, str]] = []
+    external_agency = any(k in qlow for k in ["padi", "aida", "molchanovs", "ssi"])
+    if ((not have_grounding) and confidence < 0.35) or external_agency:
+        web_ctx = searchapi_web_search(question, k=5)
 
-        last_err: Optional[str] = None
-        for mm in models_to_try:
-            text, err = gemini_rest_generate(api_key=api_key, model=mm, prompt=prompt)
-            if text and str(text).strip():
-                ans = str(text).strip()
+    # Calendar context (availability must be confirmed)
+    dates = fetch_calendar_events()
+    cal_context = (
+        "Upcoming dates from the calendar: " + ", ".join(dates)
+        if dates
+        else "Calendar shows no upcoming dates (may mean mostly free; must confirm with instructor)."
+    )
+
+    grounding_text_parts: List[str] = []
+    if course_ctx:
+        grounding_text_parts.append(
+            "COURSE SOURCES:\n" + "\n\n".join([f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in course_ctx])
+        )
+    if main_ctx:
+        grounding_text_parts.append(
+            "MAIN SITE SOURCES:\n" + "\n\n".join([f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in main_ctx])
+        )
+    if blog_ctx:
+        grounding_text_parts.append(
+            "BLOG SOURCES:\n" + "\n\n".join([f"URL: {c['url']}\nTEXT: {c['snippet']}" for c in blog_ctx])
+        )
+    if web_ctx:
+        grounding_text_parts.append(
+            "WEB RESULTS:\n" + "\n\n".join([f"TITLE: {w['title']}\nURL: {w['link']}\nSNIPPET: {w['snippet']}" for w in web_ctx])
+        )
+    grounding_text = "\n\n".join([p for p in grounding_text_parts if p.strip()]).strip()
+
+    system = (
+        "You are Aqua, the freediving assistant for Abood Freediver in Aqaba, Jordan (Red Sea).\n"
+        "You answer questions about freediving training/safety/equipment and Abood Freediver services.\n"
+        "If the user asks something unrelated to freediving/Abood Freediver, politely ask them to rephrase a freediving-related question.\n"
+        "Always prioritize safety. If the user asks for medical advice, recommend seeing a professional.\n"
+        "Respond in the same language as the user (Arabic if they write Arabic, otherwise English).\n\n"
+        "Hard business rules (ONLY booking/availability requires human confirmation):\n"
+        "1) Prices: answer directly from MAIN SITE / COURSE sources if present; also include this link for reference: https://www.aboodfreediver.com/Prices.php?lang=en\n"
+        "2) Booking/contact link: https://www.aboodfreediver.com/form1.php\n"
+        "3) Availability/dates: mention calendar dates if present; otherwise say usually available but must confirm with instructor.\n\n"
+        "Content rules:\n"
+        "- Use the provided COURSE/MAIN/BLOG sources and (if present) WEB RESULTS for factual claims.\n"
+        "- Do NOT say 'I couldn't find this on the website/blog'. Just answer.\n"
+        "- If the exact detail is not in sources, give a best-effort general answer and suggest contacting the instructor for confirmation only if it is about booking/availability.\n"
+        "- When you use info from sources, cite the URL(s).\n"
+    )
+
+    msgs: List[Dict[str, str]] = [
+        {
+            "role": "system",
+            "content": system
+            + "\n\n"
+            + cal_context
+            + (("\n\n" + grounding_text) if grounding_text else "")
+            + f"\n\nCONFIDENCE_HINT: {confidence:.2f}",
+        }
+    ]
+
+    if history:
+        for m in history[-12:]:
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                msgs.append({"role": role, "content": content})
+
+    msgs.append({"role": "user", "content": question})
+
+    # --- Try REST first (most reliable) ---
+    prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
+
+    fallback_models = [
+        m.strip()
+        for m in _env("GEMINI_FALLBACK_MODELS", default="gemini-2.0-flash,gemini-1.5-flash").split(",")
+        if m.strip()
+    ]
+    models_to_try = [model] + [m for m in fallback_models if m != model]
+
+    last_err: Optional[str] = None
+    for mm in models_to_try:
+        text, err = gemini_rest_generate(api_key=api_key, model=mm, prompt=prompt)
+        if text and str(text).strip():
+            ans = str(text).strip()
             _cache_set(ck, ans)
             return ans
-            last_err = err or last_err
+        last_err = err or last_err
 
-        if last_err:
-            _log("Gemini REST failed:", last_err)
-    except Exception as e:
-        _log("gemini REST wrapper failed:", type(e).__name__, str(e))
+    if last_err:
+        _log("Gemini REST failed:", last_err)
 
-# --- Try new SDK first: google-genai ---
+    # --- Try new SDK: google-genai ---
     try:
         from google import genai  # type: ignore
 
         client = genai.Client(api_key=api_key)
-        prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs])
-
         resp = client.models.generate_content(
             model=model,
             contents=prompt,
@@ -794,12 +821,11 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
         genai_old.configure(api_key=api_key)
         gm = genai_old.GenerativeModel(
             model_name=model,
-            system_instruction=system + "\n\n" + cal_context + ("\n\n" + grounding_text if grounding_text else ""),
+            system_instruction=system + "\n\n" + cal_context + (("\n\n" + grounding_text) if grounding_text else ""),
         )
-
-        prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs if m["role"] != "system"])
+        prompt2 = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in msgs if m["role"] != "system"])
         r = gm.generate_content(
-            prompt,
+            prompt2,
             generation_config={"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 700},
         )
         text = getattr(r, "text", None)
@@ -809,12 +835,17 @@ def gemini_rest_generate(api_key: str, model: str, prompt: str) -> Tuple[Optiona
             return ans
     except Exception as e:
         _log("google-generativeai failed:", type(e).__name__, str(e))
-        return None
 
-    return None
+    # If Gemini is unavailable (quota/rate limit), answer from retrieved snippets; if none, use web results text.
+    combined_ctx: List[Dict[str, str]] = []
+    combined_ctx.extend(course_ctx or [])
+    combined_ctx.extend(main_ctx or [])
+    combined_ctx.extend(blog_ctx or [])
 
-
-
+    web_txt = _format_web_ctx(web_ctx) if web_ctx else ""
+    ans2 = build_extractive_answer(question, lang, combined_ctx, web_ctx=web_txt)
+    _cache_set(ck, ans2)
+    return ans2
 def detect_lang(text: str) -> str:
     # very simple Arabic detection
     if re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", text):
