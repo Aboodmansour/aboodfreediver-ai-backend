@@ -78,8 +78,12 @@ def _env(*names: str, default: str = "") -> str:
     return default
 
 
+def _debug_enabled() -> bool:
+    return _env("DEBUG_LOG", default="").strip().lower() in ("1", "true", "yes", "on")
+
+
 # -----------------------------
-# Site/Blog Retrieval Helpers (site -> blog -> (optional web later))
+# Site/Blog Retrieval Helpers (site -> blog -> web)
 # -----------------------------
 BASE_SITE = _env("BASE_SITE_URL", "SITE_BASE_URL", default="https://www.aboodfreediver.com/")
 if not BASE_SITE.endswith("/"):
@@ -95,8 +99,8 @@ _CACHE_TTL_SECONDS = 60 * 60  # 1 hour
 def searchapi_web_search(query: str, k: int = 5) -> List[Dict[str, str]]:
     """
     Uses SearchApi.io Google Search API.
-    Auth: api_key as query param or Authorization: Bearer <key>.
-    Docs: https://www.searchapi.io/docs/google
+    Env:
+      SEARCHAPI_KEY
     """
     api_key = _env("SEARCHAPI_KEY")
     if not api_key:
@@ -370,6 +374,9 @@ def try_gemini_answer(question: str, history: Optional[List[Dict[str, str]]]) ->
     if not have_grounding:
         web_ctx = searchapi_web_search(question, k=5)
 
+    if _debug_enabled():
+        print("WEB_SEARCH_USED", len(web_ctx))
+
     dates = fetch_calendar_events()
     cal_context = (
         "Upcoming dates from the calendar: " + ", ".join(dates)
@@ -596,16 +603,24 @@ def chat(req: ChatRequest):
         msg += f"Form: {FORM_URL}"
         return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
 
+    # Courses rule: only short “list of courses” answer.
+    # Requirements questions (age/medical/prereqs) should go to Gemini (site/blog/web).
     if any(k in q for k in ["courses", "course", "levels", "learn", "training", "certification"]):
-        msg = (
-            "We offer freediving courses for all levels:\n"
-            "- Discovery Freediver (beginner try)\n"
-            "- Freediver (Level 1)\n"
-            "- Advanced Freediver (Level 2)\n"
-            "- Master Freediver (Level 3)\n\n"
-            "Tell me your experience level and how many days you have, and I’ll recommend the best option."
-        )
-        return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
+        requirement_terms = [
+            "age", "old", "minimum", "min", "years",
+            "require", "required", "requirements", "prerequisite", "prerequisites",
+            "medical", "doctor", "fit", "fitness", "health",
+        ]
+        if not any(t in q for t in requirement_terms):
+            msg = (
+                "We offer freediving courses for all levels:\n"
+                "- Discovery Freediver (beginner try)\n"
+                "- Freediver (Level 1)\n"
+                "- Advanced Freediver (Level 2)\n"
+                "- Master Freediver (Level 3)\n\n"
+                "Tell me your experience level and how many days you have, and I’ll recommend the best option."
+            )
+            return ChatResponse(answer=msg, session_id=session_id, needs_human=False, source="rules")
 
     # try gemini
     answer = try_gemini_answer(question, req.history)
